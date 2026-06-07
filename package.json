@@ -1,0 +1,37 @@
+{
+  "name": "cc-opencode-bridge",
+  "version": "0.1.0",
+  "description": "ACP-native dispatch bridge from Claude Code to opencode. Real-time bidirectional event streaming over the Agent Client Protocol.",
+  "type": "module",
+  "bin": {
+    "cco": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "opencode",
+    "claude-code",
+    "orchestration",
+    "ai-agents"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^0.25.0",
+    "commander": "^12.1.0",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.20",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
