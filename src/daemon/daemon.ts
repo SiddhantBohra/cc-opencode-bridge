@@ -31,6 +31,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { TerminalHost } from "../terminal-host.js";
 import { SessionState } from "./session-state.js";
+import { SessionRegistry } from "./registry.js";
 import type {
   DaemonInfo,
   IpcRequest,
@@ -60,6 +61,7 @@ export class Daemon {
   private connection!: ClientSideConnection;
   private initResult!: InitializeResponse;
   private sessions = new Map<string, SessionState>();
+  private registry!: SessionRegistry;
   private terminalHost = new TerminalHost();
   private socketPath!: string;
   private daemonInfoPath!: string;
@@ -75,6 +77,8 @@ export class Daemon {
     await mkdir(ccoDir, { recursive: true });
     this.socketPath = join(ccoDir, "daemon.sock");
     this.daemonInfoPath = join(ccoDir, "daemon.json");
+    this.registry = new SessionRegistry(this.opts.cwd);
+    await this.registry.load();
 
     // Clean up stale socket
     if (existsSync(this.socketPath)) {
@@ -113,11 +117,12 @@ export class Daemon {
     this.shuttingDown = true;
     process.stderr.write("daemon: shutting down…\n");
 
-    // Close all sessions
+    // Close all sessions (opencode persists them server-side; mark archived)
     for (const sess of this.sessions.values()) {
       await sess.close().catch(() => {});
     }
     this.sessions.clear();
+    await this.registry?.archiveAll().catch(() => {});
 
     // Close terminal host
     this.terminalHost.releaseAll();
@@ -350,19 +355,43 @@ export class Daemon {
     const sessResp = await this.connection.newSession({ cwd, mcpServers: [] });
     const sid = sessResp.sessionId;
 
-    const logPath = join(cwd, ".cco", `events-${sid}.jsonl`);
-    const sess = new SessionState(sid, cwd, logPath);
-    this.sessions.set(sid, sess);
+    const sess = this.trackSession(sid, cwd);
+    await this.registry.upsert({
+      sessionId: sid,
+      cwd,
+      firstTask: params.task,
+      turnCount: 0,
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+      state: "active",
+    });
 
     this.sendResponse(socket, { id, result: { sessionId: sid } });
 
     // Start the first turn (fire-and-forget from IPC perspective —
     // the CLI will `wait` for it separately).
-    sess.runTurn(this.connection, params.task).catch(() => {});
+    this.runTrackedTurn(sess, params.task);
   }
 
   private async handleSay(id: string, params: { sessionId: string; text: string }, socket: Socket): Promise<void> {
-    const sess = this.requireSession(params.sessionId);
+    let sess = this.sessions.get(params.sessionId);
+
+    // Auto-resume: session not in memory but known to the registry —
+    // opencode persists conversations server-side, so session/resume
+    // restores full context even across daemon restarts.
+    if (!sess) {
+      const entry = this.registry.get(params.sessionId);
+      if (!entry) throw new Error(`unknown session: ${params.sessionId}`);
+      await this.connection.resumeSession({
+        sessionId: params.sessionId,
+        cwd: entry.cwd,
+        mcpServers: [],
+      });
+      sess = this.trackSession(params.sessionId, entry.cwd);
+      sess.turnCount = entry.turnCount;
+      await this.registry.touch(params.sessionId, { state: "active" });
+    }
+
     if (sess.status !== "idle") {
       this.sendResponse(socket, {
         id,
@@ -371,7 +400,28 @@ export class Daemon {
       return;
     }
     this.sendResponse(socket, { id, result: { ok: true } });
-    sess.runTurn(this.connection, params.text).catch(() => {});
+    this.runTrackedTurn(sess, params.text);
+  }
+
+  /** Create and register an in-memory SessionState. */
+  private trackSession(sid: string, cwd: string): SessionState {
+    const logPath = join(cwd, ".cco", `events-${sid}.jsonl`);
+    const sess = new SessionState(sid, cwd, logPath);
+    this.sessions.set(sid, sess);
+    return sess;
+  }
+
+  /** Run a turn and mirror its outcome into the persistent registry. */
+  private runTrackedTurn(sess: SessionState, text: string): void {
+    sess
+      .runTurn(this.connection, text)
+      .then((result) =>
+        this.registry.touch(sess.id, {
+          turnCount: sess.turnCount,
+          lastMessage: result.lastMessage?.slice(0, 500),
+        }),
+      )
+      .catch(() => {});
   }
 
   private handleAnswer(id: string, params: { requestId: string; optionId: string }, socket: Socket): void {
@@ -442,6 +492,7 @@ export class Daemon {
     } catch { /* agent may not support close */ }
     await sess.close();
     this.sessions.delete(params.sessionId);
+    await this.registry.touch(params.sessionId, { state: "archived" });
     this.sendResponse(socket, { id, result: { ok: true } });
   }
 

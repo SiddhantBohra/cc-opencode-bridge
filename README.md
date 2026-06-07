@@ -107,6 +107,7 @@ cco wait $SID --cwd ./my-app
 | `cco cancel <sid> [--cwd]` | Cancel an in-progress turn |
 | `cco end <sid> [--cwd]` | Close session, free resources |
 | `cco events <sid> [--cwd] [-f] [-s seq] [--json]` | Stream/replay events |
+| `cco sessions [--cwd] [--json]` | List all known sessions — works even when the daemon is down |
 
 ### Legacy (one-shot, no daemon)
 
@@ -210,6 +211,15 @@ The daemon implements the full **client side** of the ACP protocol:
 opencode's `acp` command stays alive until stdin closes (no idle timeout, no max-turn limit). One subprocess hosts unlimited sessions and turns indefinitely. The daemon keeps stdin open for the life of the process.
 
 opencode's `session/prompt` **always returns `stopReason: "end_turn"`** — cancellation surfaces as a JSON-RPC error on the pending prompt call, not as a different stop reason. The bridge handles this correctly.
+
+### Session persistence
+
+Sessions are recorded in `.cco/sessions.json` (id, first task, turn count, last message, timestamps). The registry survives daemon restarts — `cco sessions` lists past work even with the daemon down. Sending `cco say` to a session the daemon doesn't have in memory triggers an automatic ACP `session/resume`: opencode persists conversations server-side, so the full context (files discussed, decisions made) comes back, even days later in a fresh daemon.
+
+```bash
+cco sessions --cwd /work          # what was I working on?
+cco say ses_abc123 "continue where we left off" --cwd /work   # auto-resumes
+```
 
 ### Event log
 

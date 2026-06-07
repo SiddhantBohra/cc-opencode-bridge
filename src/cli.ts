@@ -225,6 +225,39 @@ program
   });
 
 program
+  .command("sessions")
+  .description("List all known sessions (works even when the daemon is down)")
+  .option("-d, --cwd <dir>", "working directory", process.cwd())
+  .option("--json", "output as JSON")
+  .action(async (opts: any) => {
+    try {
+      const { readRegistry } = await import("./daemon/registry.js");
+      const entries = await readRegistry(opts.cwd);
+      if (opts.json) {
+        process.stdout.write(JSON.stringify(entries, null, 2) + "\n");
+        return;
+      }
+      if (entries.length === 0) {
+        process.stdout.write(pc.dim("no sessions recorded\n"));
+        return;
+      }
+      for (const e of entries) {
+        const stateTag = e.state === "active" ? pc.green(e.state) : pc.dim(e.state);
+        process.stdout.write(
+          `${pc.bold(e.sessionId)}  ${stateTag}  turns=${e.turnCount}  ${pc.dim(e.lastActivityAt)}\n` +
+            `  task: ${e.firstTask.slice(0, 100)}${e.firstTask.length > 100 ? "…" : ""}\n` +
+            (e.lastMessage ? `  last: ${pc.dim(e.lastMessage.slice(0, 100))}\n` : ""),
+        );
+      }
+      process.stdout.write(
+        pc.dim(`\nresume any session with: cco say <sessionId> "<follow-up>" (daemon auto-resumes archived sessions)\n`),
+      );
+    } catch (err) {
+      die(err);
+    }
+  });
+
+program
   .command("end")
   .description("Close a session (frees agent resources)")
   .argument("<sessionId>", "session ID")
