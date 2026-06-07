@@ -294,6 +294,9 @@ function renderWaitResult(r: WaitResult): void {
   switch (r.reason) {
     case "end_turn":
       process.stdout.write(`${pc.green("✓")} turn complete\n`);
+      if (r.lastMessage) {
+        process.stdout.write(`\n${pc.cyan("◆ opencode says:")}\n${r.lastMessage.trim()}\n`);
+      }
       break;
     case "question":
       process.stdout.write(`${pc.yellow("?")} ${pc.bold("question")} from opencode\n`);

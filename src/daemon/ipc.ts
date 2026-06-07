@@ -76,6 +76,8 @@ export type WaitResult = {
   sessionId: string;
   question?: PendingQuestion;
   error?: string;
+  /** Full text of opencode's final message for the turn (agent_message_chunks joined). */
+  lastMessage?: string;
 };
 
 // ─── Exit codes for `cco wait` ──────────────────────────────────────────────

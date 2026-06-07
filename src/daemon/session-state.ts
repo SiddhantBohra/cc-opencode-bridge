@@ -24,6 +24,8 @@ export class SessionState {
   status: SessionStatus = "idle";
   turnCount = 0;
   lastActivityAt: string;
+  /** Accumulated agent message text for the current/most recent turn. */
+  private turnMessage = "";
 
   private events: EventEntry[] = [];
   private seq = 0;
@@ -65,6 +67,12 @@ export class SessionState {
 
   /** Called by the ACP client's sessionUpdate handler. */
   onSessionUpdate(n: SessionNotification): void {
+    // Accumulate the agent's message text so wait results can carry
+    // opencode's final answer/question without replaying events.
+    const u = n.update as { sessionUpdate?: string; content?: { type?: string; text?: string } };
+    if (u.sessionUpdate === "agent_message_chunk" && u.content?.type === "text" && u.content.text) {
+      this.turnMessage += u.content.text;
+    }
     this.emit("session_update", n);
   }
 
@@ -139,6 +147,7 @@ export class SessionState {
     }
     this.status = "running";
     this.turnCount++;
+    this.turnMessage = "";
     this.emit("turn_start", { turnCount: this.turnCount, prompt: text });
 
     try {
@@ -150,8 +159,9 @@ export class SessionState {
       const waitResult: WaitResult = {
         reason: "end_turn",
         sessionId: this.id,
+        lastMessage: this.turnMessage || undefined,
       };
-      this.emit("turn_end", { stopReason: result.stopReason });
+      this.emit("turn_end", { stopReason: result.stopReason, lastMessage: waitResult.lastMessage });
       this.resolveWaiters(waitResult);
       return waitResult;
     } catch (err) {
@@ -165,6 +175,7 @@ export class SessionState {
         reason: isCancelled ? "cancelled" : "error",
         sessionId: this.id,
         error: isCancelled ? undefined : msg,
+        lastMessage: this.turnMessage || undefined,
       };
       this.emit("turn_end", { stopReason: waitResult.reason, error: waitResult.error });
       this.resolveWaiters(waitResult);
@@ -190,7 +201,11 @@ export class SessionState {
   waitForTurn(timeout?: number): Promise<WaitResult> {
     // If already idle or has a pending question, resolve immediately.
     if (this.status === "idle") {
-      return Promise.resolve({ reason: "end_turn", sessionId: this.id });
+      return Promise.resolve({
+        reason: "end_turn",
+        sessionId: this.id,
+        lastMessage: this.turnMessage || undefined,
+      });
     }
     if (this.status === "awaiting_answer" && this.pendingQ) {
       return Promise.resolve({
