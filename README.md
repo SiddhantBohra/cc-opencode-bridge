@@ -236,6 +236,10 @@ Every session produces a JSONL event log at `.cco/events-<sessionId>.jsonl`:
 
 ---
 
+## Example
+
+[`examples/password-generator/`](./examples/password-generator/) is a complete artifact of the e2e flow: opencode built a TypeScript CLI (with a 14-test suite) across a 3-turn session, including a human-in-the-loop language decision relayed through Claude Code. [`DEMO.md`](./examples/password-generator/DEMO.md) walks through the full transcript.
+
 ## Roadmap
 
 - [ ] `cco serve --detach` — daemonize without holding the terminal
