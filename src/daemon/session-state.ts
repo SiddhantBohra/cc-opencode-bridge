@@ -155,6 +155,10 @@ export class SessionState {
         sessionId: this.id,
         prompt: [{ type: "text", text }],
       });
+      // opencode's prompt response can arrive before the trailing
+      // agent_message_chunk events on its async firehose — let them settle
+      // so lastMessage carries the complete final message.
+      await this.settleMessage();
       this.status = "idle";
       const waitResult: WaitResult = {
         reason: "end_turn",
@@ -180,6 +184,20 @@ export class SessionState {
       this.emit("turn_end", { stopReason: waitResult.reason, error: waitResult.error });
       this.resolveWaiters(waitResult);
       return waitResult;
+    }
+  }
+
+  /**
+   * Wait until agent message chunks stop arriving (max ~2s).
+   * Resolves early once the message has been stable for 250ms.
+   */
+  private async settleMessage(): Promise<void> {
+    const deadline = Date.now() + 2000;
+    let last = this.turnMessage;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 250));
+      if (this.turnMessage === last) return;
+      last = this.turnMessage;
     }
   }
 
@@ -244,6 +262,11 @@ export class SessionState {
   /** Get events since a sequence number. */
   eventsSince(since: number): EventEntry[] {
     return this.events.filter((e) => e.seq > since);
+  }
+
+  /** Highest sequence number emitted so far. */
+  latestSeq(): number {
+    return this.seq;
   }
 
   // ─── Info ─────────────────────────────────────────────────────────────────

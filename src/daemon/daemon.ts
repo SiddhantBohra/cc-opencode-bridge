@@ -466,8 +466,11 @@ export class Daemon {
   private handleEvents(id: string, params: { sessionId: string; since?: number; follow?: boolean }, socket: Socket): void {
     const sess = this.requireSession(params.sessionId);
 
+    // since: -1 means "only events from now on" (live tail without history)
+    const since = params.since === -1 ? sess.latestSeq() : (params.since ?? 0);
+
     // Send historical events
-    const history = sess.eventsSince(params.since ?? 0);
+    const history = sess.eventsSince(since);
     for (const entry of history) {
       this.sendResponse(socket, { id, event: entry });
     }

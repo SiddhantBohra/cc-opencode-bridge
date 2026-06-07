@@ -146,14 +146,42 @@ program
   .option("-d, --cwd <dir>", "working directory", process.cwd())
   .option("-t, --timeout <ms>", "timeout in ms", "300000")
   .option("-q, --quiet", "output only JSON, no pretty rendering")
+  .option("-s, --stream", "render live progress while waiting, then a ---RESULT--- JSON line")
   .action(async (sessionId: string, opts: any) => {
     try {
       const client = await connectDaemon(opts.cwd);
+
+      // --stream: open a second connection that follows live events and
+      // pretty-prints them while the wait call blocks. This makes opencode's
+      // thinking/tool-calls visible in real time (e.g. inside Claude Code's
+      // Bash output), like watching Claude itself work.
+      let eventsClient: DaemonClient | null = null;
+      if (opts.stream) {
+        eventsClient = await connectDaemon(opts.cwd);
+        const renderer = new StreamRenderer();
+        void eventsClient.stream(
+          "events",
+          { sessionId, since: -1, follow: true },
+          (event: unknown) => {
+            const entry = event as EventEntry;
+            if (entry.kind === "session_update") {
+              renderer.handle(entry.data as any);
+            } else if (entry.kind === "question") {
+              process.stdout.write(`\n${pc.yellow("?")} ${pc.bold("question")} ${summarize(entry.data)}\n`);
+            }
+          },
+        ).catch(() => { /* events stream ends when daemon closes the socket */ });
+      }
+
       const result = await client.call<WaitResult>("wait", {
         sessionId,
         timeout: parseInt(opts.timeout, 10),
       });
-      if (opts.quiet) {
+      eventsClient?.close();
+
+      if (opts.stream) {
+        process.stdout.write(`\n---RESULT---\n${JSON.stringify(result)}\n`);
+      } else if (opts.quiet) {
         process.stdout.write(JSON.stringify(result) + "\n");
       } else {
         renderWaitResult(result);
