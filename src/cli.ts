@@ -147,6 +147,7 @@ program
   .option("-t, --timeout <ms>", "timeout in ms", "300000")
   .option("-q, --quiet", "output only JSON, no pretty rendering")
   .option("-s, --stream", "render live progress while waiting, then a ---RESULT--- JSON line")
+  .option("-v, --verbose", "with --stream: include raw tool inputs/outputs (expanded view)")
   .action(async (sessionId: string, opts: any) => {
     try {
       const client = await connectDaemon(opts.cwd);
@@ -158,7 +159,7 @@ program
       let eventsClient: DaemonClient | null = null;
       if (opts.stream) {
         eventsClient = await connectDaemon(opts.cwd);
-        const renderer = new StreamRenderer();
+        const renderer = new StreamRenderer({ verbose: !!opts.verbose });
         void eventsClient.stream(
           "events",
           { sessionId, since: -1, follow: true },

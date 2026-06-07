@@ -1,5 +1,6 @@
 import pc from "picocolors";
 import type { SessionNotification } from "@agentclientprotocol/sdk";
+import { renderDiff } from "./diff.js";
 
 export type RendererOptions = {
   /** Suppress all output (useful for machine-readable mode where only the JSONL log matters). */
@@ -179,7 +180,11 @@ export class StreamRenderer {
       const preview = text.length > 600 ? text.slice(0, 600) + "…" : text;
       process.stdout.write(pc.dim(indent(preview, 4)) + "\n");
     } else if (c.type === "diff") {
-      process.stdout.write(pc.dim(`    [diff: ${c.path}]\n`));
+      // Claude-Code-style colored diff: red deletions, green additions,
+      // dim context, unchanged regions collapsed.
+      process.stdout.write(pc.bold(pc.dim(`    ── ${c.path}\n`)));
+      const rendered = renderDiff(c.oldText, c.newText ?? "", { indent: "    " });
+      if (rendered) process.stdout.write(rendered + "\n");
     } else if (c.type === "terminal") {
       process.stdout.write(pc.dim(`    [terminal: ${c.terminalId}]\n`));
     }
