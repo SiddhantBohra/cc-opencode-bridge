@@ -206,6 +206,18 @@ The daemon implements the full **client side** of the ACP protocol:
 | `terminal/wait_for_exit` | Block until process exits |
 | `terminal/kill` / `release` | Signal and cleanup |
 
+### Multi-agent fan-out
+
+Everything is scoped per `--cwd` — the socket, the registry, the opencode process. Running multiple daemons in different directories gives you N truly parallel opencode instances, with the orchestrator (Claude Code) coordinating across them:
+
+```bash
+git worktree add .wt-taskA -b taskA && cco serve --cwd .wt-taskA &
+git worktree add .wt-taskB -b taskB && cco serve --cwd .wt-taskB &
+# dispatch independently, wait on both, merge results yourself
+```
+
+Don't ask one opencode session to multiplex parallel work: concurrent prompts on a single ACP connection are undefined behavior (opencode serializes turns through one global event stream per connection). One daemon = one turn at a time, by design. Sessions on a shared daemon isolate *context* (conversations never leak between sessionIds) but not *execution*. Separate processes buy true parallelism, crash isolation, and — with worktrees — file isolation.
+
 ### Key insight from opencode source
 
 opencode's `acp` command stays alive until stdin closes (no idle timeout, no max-turn limit). One subprocess hosts unlimited sessions and turns indefinitely. The daemon keeps stdin open for the life of the process.
