@@ -1,0 +1,100 @@
+/**
+ * IPC protocol between CLI subcommands and the daemon.
+ *
+ * Transport: NDJSON over a Unix domain socket at `.cco/daemon.sock`.
+ * Each CLI invocation connects, sends one Request, reads Responses
+ * (one or many for streaming), then closes.
+ *
+ * This is a simplified JSON-RPC 2.0 subset — no batching, no notifications
+ * from client to daemon (except disconnect = implicit cancel-follow).
+ */
+
+// ─── Requests (CLI → daemon) ────────────────────────────────────────────────
+
+export type IpcRequest =
+  | { id: string; method: "start"; params: StartParams }
+  | { id: string; method: "say"; params: SayParams }
+  | { id: string; method: "answer"; params: AnswerParams }
+  | { id: string; method: "cancel"; params: CancelParams }
+  | { id: string; method: "wait"; params: WaitParams }
+  | { id: string; method: "status"; params: StatusParams }
+  | { id: string; method: "events"; params: EventsParams }
+  | { id: string; method: "end"; params: EndParams }
+  | { id: string; method: "stop"; params: StopParams };
+
+export type StartParams = { task: string; cwd: string };
+export type SayParams = { sessionId: string; text: string };
+export type AnswerParams = { requestId: string; optionId: string; text?: string };
+export type CancelParams = { sessionId: string };
+export type WaitParams = { sessionId: string; timeout?: number };
+export type StatusParams = Record<string, never>;
+export type EventsParams = { sessionId: string; since?: number; follow?: boolean };
+export type EndParams = { sessionId: string };
+export type StopParams = Record<string, never>;
+
+// ─── Responses (daemon → CLI) ───────────────────────────────────────────────
+
+export type IpcResponse =
+  | { id: string; result: unknown }
+  | { id: string; error: { code: number; message: string } }
+  | { id: string; event: EventEntry };
+
+// ─── Shared types ───────────────────────────────────────────────────────────
+
+export type SessionStatus = "idle" | "running" | "awaiting_answer" | "cancelled" | "closed";
+
+export type SessionInfo = {
+  sessionId: string;
+  cwd: string;
+  status: SessionStatus;
+  turnCount: number;
+  pendingQuestion?: PendingQuestion;
+  createdAt: string;
+  lastActivityAt: string;
+};
+
+export type PendingQuestion = {
+  requestId: string;
+  title: string;
+  options: Array<{ optionId: string; name: string; kind: string }>;
+};
+
+export type EventEntry = {
+  seq: number;
+  ts: string;
+  sessionId: string;
+  kind: string;
+  data: unknown;
+};
+
+// ─── Wait result exit reasons ───────────────────────────────────────────────
+
+export type WaitReason = "end_turn" | "question" | "cancelled" | "error" | "timeout";
+
+export type WaitResult = {
+  reason: WaitReason;
+  sessionId: string;
+  question?: PendingQuestion;
+  error?: string;
+};
+
+// ─── Exit codes for `cco wait` ──────────────────────────────────────────────
+
+export const WAIT_EXIT_CODES: Record<WaitReason, number> = {
+  end_turn: 0,
+  question: 10,
+  cancelled: 11,
+  error: 12,
+  timeout: 13,
+};
+
+// ─── Daemon info file (.cco/daemon.json) ────────────────────────────────────
+
+export type DaemonInfo = {
+  pid: number;
+  socketPath: string;
+  cwd: string;
+  startedAt: string;
+  agentName?: string;
+  agentVersion?: string;
+};

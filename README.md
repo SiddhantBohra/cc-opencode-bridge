@@ -1,164 +1,240 @@
 # cc-opencode-bridge
 
-**ACP-native dispatch from Claude Code to opencode.** Claude Code hands work off to opencode over the Agent Client Protocol; opencode streams every thought, tool call, file edit, and terminal command back in real time over the same channel. No MCP, no HTTP server, no glue scripts — one binary, one JSON-RPC link over stdio.
+**ACP-native bidirectional bridge from Claude Code to opencode.** One long-lived daemon keeps opencode alive across unlimited turns. Claude Code sends tasks, follow-ups, and answers; opencode streams thoughts, tool calls, file edits, and questions back — all over the Agent Client Protocol, all in real time, with zero MCP.
 
 ```
-┌───────────────┐                       ┌──────────────────┐                       ┌────────────┐
-│  Claude Code  │ ── Bash: cco dispatch │  cc-opencode-    │ ── ACP JSON-RPC ───── │  opencode  │
-│  (or any      │ ───────────────────▶  │  bridge (Node)   │ ◀── over stdio ────── │   acp      │
-│   shell)      │                       │                  │   (NDJSON)            │            │
-└───────────────┘                       └──────────────────┘                       └────────────┘
-                                                │
-                                                └─▶ pretty event stream to stdout
-                                                └─▶ full JSONL event log to disk
+┌───────────────┐   cco start/say/   ┌──────────────────┐   ACP JSON-RPC    ┌──────────────┐
+│  Claude Code  │──  answer/cancel ─▶│  cc-opencode-    │──  over stdio  ──▶│  opencode    │
+│  (Bash calls) │◀── wait/events ───│  bridge daemon   │◀── (NDJSON)  ────│   acp        │
+└───────────────┘   (Unix socket)    └──────────────────┘                   └──────────────┘
+                                              │
+                                              ├─▶ JSONL event log per session
+                                              └─▶ .cco/daemon.sock (IPC)
 ```
 
 ---
 
-## Why this exists
+## What's different
 
-You're driving a task in Claude Code and you want a second coding agent — opencode — to do the actual implementation, while Claude Code stays in the loop with full real-time visibility. The naive options:
-
-- **Shell out to `opencode run`** — works, but it's one-shot text. No mid-task feedback, no session resumption, no structured events.
-- **MCP server inside opencode** — couples opencode to a specific transport and reverses the orchestration direction. You wanted Claude Code on top.
-- **Wrap a whole platform** like claw-orchestrator — comprehensive, but you inherit all of its abstractions.
-
-`cc-opencode-bridge` does exactly one thing: speaks **ACP** (the canonical agent-to-agent protocol from Zed Industries) to opencode's `acp` server, and exposes it as a CLI that Claude Code can call via Bash. Every tool call opencode makes (write file, run command, request permission) round-trips through this bridge in real time.
+| Feature | `opencode run` | `acpx` | `claw-orchestrator` | **`cc-opencode-bridge`** |
+| --- | --- | --- | --- | --- |
+| Bidirectional dialog | No | Partial | Yes (custom runtime) | **Yes (ACP-native)** |
+| Session persistence | No | No | Yes | **Yes (resume across turns)** |
+| Mid-task questions | No | No | N/A | **Yes (request_permission ↔ cco answer)** |
+| Realtime event stream | No | Yes | Yes (dashboard) | **Yes (JSONL + cco events)** |
+| Cancellation | Ctrl-C | Yes | Yes | **Yes (cco cancel → session/cancel)** |
+| One process, many turns | No (spawn per call) | No | Yes | **Yes (daemon keeps opencode alive)** |
+| Claude-Code-friendly | 7/10 | 6/10 | 4/10 | **10/10 (exit codes, JSON output)** |
+| Transport | stdio (one-shot) | stdio | HTTP/WS | **ACP over stdio (spec-compliant)** |
+| Official SDK | No | No | No | **Yes (@agentclientprotocol/sdk)** |
 
 ## Install
 
 ```bash
-git clone https://github.com/<you>/cc-opencode-bridge
+git clone https://github.com/SiddhantBohra/cc-opencode-bridge
 cd cc-opencode-bridge
 npm install
 npm run build
 npm link        # exposes `cco` globally
 ```
 
-Prerequisites: Node 20+, [`opencode`](https://github.com/sst/opencode) v1.15.3 or later on `PATH`.
+Prerequisites: Node 20+, [`opencode`](https://github.com/sst/opencode) v1.15+ on `PATH`.
 
-## Use
+---
 
-### One-shot dispatch
+## Quick start
 
-```bash
-cco dispatch "Add a /healthz endpoint that returns 200 OK with the git sha" --cwd ./my-app
-```
-
-Claude Code can invoke that via Bash and get the full event stream back as stdout. Add `-q` for a quiet run (events only in the JSONL log).
-
-### Resume a session
+### One-shot dispatch (no daemon)
 
 ```bash
-cco dispatch "Now write a test for it" --cwd ./my-app --resume ses_15d7be879ffeQ1tt3Y0R6N0Owj
+cco dispatch "Add a /healthz endpoint" --cwd ./my-app
 ```
 
-The session ID is printed at the end of every dispatch (and recorded in the JSONL log).
-
-### Replay or live-tail an event log
+### Daemon mode (multi-turn, bidirectional)
 
 ```bash
-cco tail .cco/events-2026-06-07T14-37-28-824Z.jsonl       # replay
-cco tail .cco/events-2026-06-07T14-37-28-824Z.jsonl -f    # follow live
+# Terminal 1: start the daemon
+cco serve --cwd ./my-app
+
+# Terminal 2 (or from Claude Code via Bash):
+SID=$(cco start "Refactor auth.ts to use bcrypt" --cwd ./my-app | jq -r .sessionId)
+cco wait $SID --cwd ./my-app        # blocks until done or question
+# exit 0 = done, 10 = question, 11 = cancelled
+
+# Send a follow-up (reuses same session, same opencode process)
+cco say $SID "Now write tests for it" --cwd ./my-app
+cco wait $SID --cwd ./my-app
+
+# Watch events live from another terminal
+cco events $SID --follow --cwd ./my-app
 ```
 
-Useful when Claude Code dispatches in one terminal and you want to watch from another, or to post-mortem a dispatch from its log.
+### Answering questions from opencode
 
-## CLI
+When opencode needs permission (e.g., to run a command), it pauses and asks. `cco wait` returns exit code `10` with the question details:
 
-```
-cco dispatch <task> [options]
-  -d, --cwd <dir>             working directory for the agent (default: cwd)
-  -a, --agent <cmd>           agent binary (default: opencode)
-      --agent-arg <arg...>    extra args appended after `acp`
-  -p, --permission <mode>     auto | interactive | deny (default: auto)
-  -l, --log <path>            JSONL event log (default: ./.cco/events-<ts>.jsonl)
-  -r, --resume <sessionId>    resume an existing session
-  -q, --quiet                 suppress pretty output (events only in JSONL log)
-  -v, --verbose               include raw tool inputs/outputs in pretty output
-      --stderr                inherit opencode's stderr (debug the agent)
+```bash
+cco wait $SID --cwd ./my-app --quiet
+# Output: {"reason":"question","sessionId":"ses_...","question":{"requestId":"q_42","title":"Run npm install?","options":[{"optionId":"allow_once","name":"Allow once","kind":"allow_once"},...]}}
 
-cco tail <path> [-f|--follow]
+# Answer it:
+cco answer q_42 allow_once --cwd ./my-app
+
+# Then wait for the turn to finish:
+cco wait $SID --cwd ./my-app
 ```
 
-## How the bridge works
+---
 
-The bridge is a [`ClientSideConnection`](https://agentclientprotocol.github.io/typescript-sdk/classes/ClientSideConnection.html) from the official `@agentclientprotocol/sdk`. On every `dispatch` it:
+## CLI reference
 
-1. Spawns `opencode acp` as a subprocess with piped stdio.
-2. Converts the child's stdin/stdout to Web Streams and wraps them with `ndJsonStream`.
-3. Performs the ACP `initialize` handshake, advertising **client** capabilities: `fs.readTextFile`, `fs.writeTextFile`, `terminal`.
-4. Calls `session/new` (or `session/resume`/`session/load` when `--resume` is given) and then `session/prompt` with the task.
-5. Implements the full **client side** of ACP so opencode can call back into the bridge:
+### Daemon lifecycle
 
-   | ACP method | Bridge behavior |
-   | --- | --- |
-   | `session/update` | Pretty-print to stdout + append to JSONL log |
-   | `session/request_permission` | Auto / interactive / deny per `--permission` |
-   | `fs/read_text_file` | Read from local filesystem (relative to `--cwd`) |
-   | `fs/write_text_file` | Write to local filesystem (creates dirs) |
-   | `terminal/create` | Spawn a real child process (Node `child_process.spawn`) |
-   | `terminal/output` | Return buffered output + exit status |
-   | `terminal/wait_for_exit` | Resolve when the process exits |
-   | `terminal/kill` / `release` | Signal and cleanup |
+| Command | Purpose |
+| --- | --- |
+| `cco serve [--cwd] [--agent] [--stderr]` | Start the daemon (keeps opencode alive) |
+| `cco stop [--cwd]` | Shut down the daemon |
+| `cco status [--cwd] [--json]` | Show daemon info + active sessions |
 
-6. Awaits the `session/prompt` response and exits with `0` on `end_turn`, `2` otherwise.
+### Session control
 
-### What gets logged
+| Command | Purpose |
+| --- | --- |
+| `cco start <task> [--cwd]` | Create session, send first task, return `{sessionId}` |
+| `cco say <sid> <text> [--cwd]` | Send follow-up to an idle session |
+| `cco wait <sid> [--cwd] [-t ms] [-q]` | Block until turn ends, question, cancel, or timeout |
+| `cco answer <reqid> <optionId> [--cwd]` | Answer a pending question |
+| `cco cancel <sid> [--cwd]` | Cancel an in-progress turn |
+| `cco end <sid> [--cwd]` | Close session, free resources |
+| `cco events <sid> [--cwd] [-f] [-s seq] [--json]` | Stream/replay events |
 
-Every event observed during a dispatch is appended to a JSONL file:
+### Legacy (one-shot, no daemon)
+
+| Command | Purpose |
+| --- | --- |
+| `cco dispatch <task> [--cwd] [-r sid] [-q] [-v]` | Spawn opencode, run one turn, exit |
+| `cco tail <path> [-f]` | Replay a JSONL log file |
+
+### Exit codes for `cco wait`
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Turn completed (`end_turn`) |
+| `10` | Question pending — answer with `cco answer` |
+| `11` | Turn was cancelled |
+| `12` | Error |
+| `13` | Timeout |
+
+---
+
+## How Claude Code should use this
+
+The intended orchestration pattern from Claude Code:
+
+```bash
+# Bootstrap (once per project)
+cco serve --cwd /work &
+
+# Dispatch a task
+SID=$(cco start "Implement the auth module" --cwd /work | jq -r .sessionId)
+
+# Wait loop: handle turns, questions, follow-ups
+while true; do
+  cco wait $SID --cwd /work --quiet > /tmp/wait.json 2>&1
+  RC=$?
+
+  if [ $RC -eq 0 ]; then
+    # Turn complete — read events, summarize, done
+    break
+  elif [ $RC -eq 10 ]; then
+    # Question from opencode
+    REQID=$(jq -r .question.requestId /tmp/wait.json)
+    TITLE=$(jq -r .question.title /tmp/wait.json)
+    # Claude Code decides based on the question title
+    cco answer $REQID allow_once --cwd /work
+  elif [ $RC -eq 11 ]; then
+    echo "Cancelled"
+    break
+  else
+    echo "Error"
+    break
+  fi
+done
+
+# Send a follow-up in the same session
+cco say $SID "Now add error handling" --cwd /work
+cco wait $SID --cwd /work
+
+# Cleanup
+cco end $SID --cwd /work
+cco stop --cwd /work
+```
+
+---
+
+## Architecture
+
+### Daemon mode
+
+```
+cco serve
+  └─ spawns `opencode acp` (one long-lived subprocess)
+  └─ listens on .cco/daemon.sock (Unix domain socket)
+  └─ manages N concurrent sessions with per-session state machines:
+      idle → running → (awaiting_answer ↔ running)* → idle
+
+cco start/say/answer/cancel/wait/events/end/stop
+  └─ connects to .cco/daemon.sock
+  └─ sends one JSON-RPC request
+  └─ reads response (or streams events for `events --follow`)
+  └─ disconnects + exits
+```
+
+### ACP client implementation
+
+The daemon implements the full **client side** of the ACP protocol:
+
+| ACP method | Bridge behavior |
+| --- | --- |
+| `session/update` | Record in session event log + stream to followers |
+| `session/request_permission` | Surface as "question" event; block until `cco answer` resolves it |
+| `fs/read_text_file` | Read from local filesystem |
+| `fs/write_text_file` | Write to local filesystem (creates dirs) |
+| `terminal/create` | Spawn real child process |
+| `terminal/output` | Return buffered output + exit status |
+| `terminal/wait_for_exit` | Block until process exits |
+| `terminal/kill` / `release` | Signal and cleanup |
+
+### Key insight from opencode source
+
+opencode's `acp` command stays alive until stdin closes (no idle timeout, no max-turn limit). One subprocess hosts unlimited sessions and turns indefinitely. The daemon keeps stdin open for the life of the process.
+
+opencode's `session/prompt` **always returns `stopReason: "end_turn"`** — cancellation surfaces as a JSON-RPC error on the pending prompt call, not as a different stop reason. The bridge handles this correctly.
+
+### Event log
+
+Every session produces a JSONL event log at `.cco/events-<sessionId>.jsonl`:
 
 ```jsonl
-{"ts":"…","kind":"dispatch_start","data":{"cwd":"…","task":"…"}}
-{"ts":"…","kind":"initialize","data":{"protocolVersion":1,"agentCapabilities":{…}}}
-{"ts":"…","kind":"session_ready","data":{"sessionId":"ses_…"}}
-{"ts":"…","kind":"session_update","data":{"sessionId":"…","update":{"sessionUpdate":"tool_call","title":"write",…}}}
-{"ts":"…","kind":"fs_write","data":{"path":"…","bytes":47}}
-{"ts":"…","kind":"terminal_create","data":{"command":"bash","args":["-c","python3 calc.py"]}}
-{"ts":"…","kind":"session_update","data":{"sessionId":"…","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Done. "}}}}
-{"ts":"…","kind":"prompt_complete","data":{"sessionId":"…","stopReason":"end_turn"}}
+{"ts":"...","kind":"turn_start","data":{"turnCount":1,"prompt":"..."}}
+{"ts":"...","kind":"session_update","data":{"sessionId":"...","update":{"sessionUpdate":"tool_call",...}}}
+{"ts":"...","kind":"question","data":{"requestId":"q_5","title":"Run npm install?","options":[...]}}
+{"ts":"...","kind":"answer","data":{"requestId":"q_5","optionId":"allow_once"}}
+{"ts":"...","kind":"turn_end","data":{"stopReason":"end_turn"}}
+{"ts":"...","kind":"turn_start","data":{"turnCount":2,"prompt":"Now add tests"}}
 ```
 
-This file is a complete machine-readable transcript of the dispatch — replayable with `cco tail`, ingestible by other tools.
-
-## Calling from Claude Code
-
-The intended flow:
-
-```text
-User → Claude Code → Bash("cco dispatch '<task>' --cwd /work")
-                       ↓
-                     bridge → opencode (ACP)
-                       ↓
-                     stream events back to Claude Code's tool output
-                       ↓
-                     Claude Code reads the final summary + diff and reports
-```
-
-For background dispatch (let opencode chew on a long task while Claude Code continues other work):
-
-```bash
-cco dispatch "<task>" --cwd /work --quiet > /tmp/dispatch.log 2>&1 &
-# later — read the JSONL log or tail it
-cco tail /tmp/dispatch.log -f
-```
-
-## Differences from prior art
-
-| Project | Direction | Transport | Notes |
-| --- | --- | --- | --- |
-| `opencode run` | Claude Code → opencode | stdio (one-shot text) | No streaming, no resume, no callbacks |
-| `acp-claude-code` | Zed → Claude Code | ACP | Wraps Claude Code *as* an ACP agent (opposite direction) |
-| `acpx` | CLI → any ACP agent | ACP | General-purpose CLI; this project focuses on the Claude-Code-driving-opencode flow |
-| `claw-orchestrator` | Editor → many agents | Custom runtime | Full platform: dashboard, council, autoloop |
-| **`cc-opencode-bridge`** | **Claude Code → opencode** | **ACP** | **One bridge, fully ACP-native, with the client side completely implemented** |
+---
 
 ## Roadmap
 
-- `cco serve` — long-running daemon with HTTP control plane and SSE event stream
-- Council mode: parallel dispatches in isolated git worktrees with vote-based merge
-- Bidirectional handoff: opencode pauses → asks Claude Code a question → resumes on answer
-- Wrap other ACP-compatible agents (Gemini CLI, Codex) behind the same `cco dispatch` UX
+- [ ] `cco serve --detach` — daemonize without holding the terminal
+- [ ] Auto-start daemon on first `cco start` if not running
+- [ ] Council mode — parallel dispatches in isolated git worktrees with vote-based merge
+- [ ] `session/set_mode` support — switch opencode between architect/code/ask modes
+- [ ] Web dashboard via `cco serve --http` — SSE event stream + browser UI
+- [ ] Multi-agent — wrap Gemini CLI, Codex, and other ACP-compatible agents behind the same `cco` UX
+- [ ] `_cco/*` extension methods — Claude Code→opencode sidechannel for mid-turn context injection
 
 ## License
 
