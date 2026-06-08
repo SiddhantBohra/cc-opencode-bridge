@@ -74,13 +74,16 @@ program
   .option("-a, --agent <cmd>", "agent binary", "opencode")
   .option("--agent-arg <arg...>", "extra args after `acp`")
   .option("--stderr", "inherit agent stderr")
+  .option("--http [port]", "serve a web dashboard (default port 7777)")
   .action(async (opts: any) => {
     try {
+      const httpPort = opts.http === undefined ? undefined : (opts.http === true ? 7777 : parseInt(opts.http, 10));
       const daemon = new Daemon({
         cwd: opts.cwd,
         agentCommand: opts.agent,
         agentArgs: opts.agentArg,
         inheritStderr: opts.stderr,
+        httpPort,
       });
       await daemon.start();
       // Keep process alive — daemon.start() sets up signal handlers

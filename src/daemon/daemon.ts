@@ -32,11 +32,13 @@ import { Readable, Writable } from "node:stream";
 import { TerminalHost } from "../terminal-host.js";
 import { SessionState } from "./session-state.js";
 import { SessionRegistry } from "./registry.js";
+import { HttpServer } from "./http-server.js";
 import type {
   DaemonInfo,
   IpcRequest,
   IpcResponse,
   EventEntry,
+  SessionInfo,
   WaitResult,
 } from "./ipc.js";
 
@@ -45,6 +47,7 @@ export type DaemonOptions = {
   agentCommand?: string;
   agentArgs?: string[];
   inheritStderr?: boolean;
+  httpPort?: number;
 };
 
 /**
@@ -67,9 +70,18 @@ export class Daemon {
   private daemonInfoPath!: string;
   private shuttingDown = false;
   private stderrLogStream: WriteStream | null = null;
+  private httpServer: HttpServer | null = null;
 
   constructor(opts: DaemonOptions) {
     this.opts = { ...opts, cwd: resolve(opts.cwd) };
+  }
+
+  getSession(id: string): SessionState | undefined {
+    return this.sessions.get(id);
+  }
+
+  listSessions(): SessionInfo[] {
+    return [...this.sessions.values()].map((s) => s.toInfo());
   }
 
   /** Start the daemon: spawn opencode, initialize ACP, listen on socket. */
@@ -91,6 +103,16 @@ export class Daemon {
 
     // Listen for CLI connections
     await this.listen();
+
+    // Start HTTP dashboard if configured
+    if (this.opts.httpPort) {
+      this.httpServer = new HttpServer(
+        this.opts.httpPort,
+        (id) => this.getSession(id),
+        () => [...this.sessions.values()].map((s) => ({ sessionId: s.id, status: s.status, turnCount: s.turnCount })),
+      );
+      await this.httpServer.start();
+    }
 
     // Write daemon info file
     const info: DaemonInfo = {
@@ -128,6 +150,9 @@ export class Daemon {
 
     // Close terminal host
     this.terminalHost.releaseAll();
+
+    // Close HTTP server
+    this.httpServer?.stop();
 
     // Close socket server
     this.server?.close();
