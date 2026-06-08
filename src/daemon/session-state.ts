@@ -198,13 +198,21 @@ export class SessionState {
       // agent_message_chunk events on its async firehose — let them settle
       // so lastMessage carries the complete final message.
       await this.settleMessage();
+      // opencode 1.16+ aborts a cancelled run but still RESOLVES prompt() with
+      // stopReason "end_turn" (older versions threw — handled in catch below).
+      // If cancelTurn() flipped us to "cancelled", honor that over end_turn so
+      // `cco wait` still reports cancelled (exit 11), not done (exit 0).
+      const wasCancelled = (this.status as string) === "cancelled";
       this.status = "idle";
       const waitResult: WaitResult = {
-        reason: "end_turn",
+        reason: wasCancelled ? "cancelled" : "end_turn",
         sessionId: this.id,
         lastMessage: this.turnMessage || undefined,
       };
-      this.emit("turn_end", { stopReason: result.stopReason, lastMessage: waitResult.lastMessage });
+      this.emit("turn_end", {
+        stopReason: wasCancelled ? "cancelled" : result.stopReason,
+        lastMessage: waitResult.lastMessage,
+      });
       this.resolveWaiters(waitResult);
       return waitResult;
     } catch (err) {

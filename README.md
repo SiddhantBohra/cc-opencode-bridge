@@ -222,7 +222,7 @@ Don't ask one opencode session to multiplex parallel work: concurrent prompts on
 
 opencode's `acp` command stays alive until stdin closes (no idle timeout, no max-turn limit). One subprocess hosts unlimited sessions and turns indefinitely. The daemon keeps stdin open for the life of the process.
 
-opencode's `session/prompt` **always returns `stopReason: "end_turn"`** — cancellation surfaces as a JSON-RPC error on the pending prompt call, not as a different stop reason. The bridge handles this correctly.
+opencode's `session/prompt` **always resolves with `stopReason: "end_turn"`** — even when the turn is cancelled. On `session/cancel`, opencode 1.16+ aborts the active run but still resolves the pending prompt call cleanly with `end_turn` (older versions rejected it with a JSON-RPC error). So a cancelled turn is **indistinguishable from a completed one by stop reason alone**. The bridge handles both: when `cco cancel` fires, it flags the session `cancelled` before issuing `session/cancel`, then maps the resolved (or rejected) turn to `reason: "cancelled"` — so `cco wait` reports `cancelled` (exit 11) on every opencode version, not a false `end_turn`.
 
 ### Session persistence
 
