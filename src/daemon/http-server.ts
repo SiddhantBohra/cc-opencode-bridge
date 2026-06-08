@@ -22,7 +22,9 @@ export class HttpServer {
 
   start(): Promise<void> {
     return new Promise((resolve) => {
-      this.server.listen(this.port, () => {
+      // Loopback only — the dashboard exposes session content, so never bind
+      // it to 0.0.0.0 where it'd be reachable from the network.
+      this.server.listen(this.port, "127.0.0.1", () => {
         process.stderr.write(`daemon: http dashboard on http://localhost:${this.port}\n`);
         resolve();
       });

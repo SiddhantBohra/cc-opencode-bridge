@@ -1,9 +1,9 @@
 /**
  * IPC protocol between CLI subcommands and the daemon.
  *
- * Transport: NDJSON over a Unix domain socket at `.cco/daemon.sock`.
- * Each CLI invocation connects, sends one Request, reads Responses
- * (one or many for streaming), then closes.
+ * Transport: NDJSON over loopback TCP (127.0.0.1, ephemeral port from
+ * daemon.json). Each CLI invocation connects, sends one Request carrying the
+ * daemon's auth token, reads Responses (one or many for streaming), then closes.
  *
  * This is a simplified JSON-RPC 2.0 subset — no batching, no notifications
  * from client to daemon (except disconnect = implicit cancel-follow).
@@ -121,12 +121,15 @@ export const WAIT_EXIT_CODES: Record<WaitReason, number> = {
   timeout: 13,
 };
 
-// ─── Daemon info file (.cco/daemon.json) ────────────────────────────────────
+// ─── Daemon info file (~/.cco/projects/<encoded-cwd>/daemon.json) ────────────
 
 export type DaemonInfo = {
   pid: number;
   childPid?: number;
-  socketPath: string;
+  /** Loopback TCP port the daemon listens on (replaces the old Unix socket). */
+  port: number;
+  /** Per-daemon auth token; CLI clients must present it on every request. */
+  token: string;
   cwd: string;
   startedAt: string;
   agentName?: string;

@@ -1,14 +1,17 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
 import type { DaemonIndexEntry } from "./ipc.js";
+import { ccoHome, globalIndexPath } from "../paths.js";
 
-const GLOBAL_DIR = join(homedir(), ".cco");
-const GLOBAL_PATH = join(GLOBAL_DIR, "daemons.json");
+const GLOBAL_PATH = globalIndexPath();
+
+// The index holds per-daemon auth tokens, so keep it owner-only (0600).
+function writeIndex(entries: DaemonIndexEntry[]): void {
+  writeFileSync(GLOBAL_PATH, JSON.stringify(entries, null, 2), { mode: 0o600 });
+}
 
 function ensureDir(): void {
-  if (!existsSync(GLOBAL_DIR)) {
-    mkdirSync(GLOBAL_DIR, { recursive: true });
+  if (!existsSync(ccoHome())) {
+    mkdirSync(ccoHome(), { recursive: true });
   }
 }
 
@@ -28,7 +31,7 @@ export function readDaemons(): DaemonIndexEntry[] {
     const entries = JSON.parse(raw) as DaemonIndexEntry[];
     const alive = entries.filter((e) => isPidAlive(e.pid));
     if (alive.length !== entries.length) {
-      writeFileSync(GLOBAL_PATH, JSON.stringify(alive, null, 2));
+      writeIndex(alive);
     }
     return alive;
   } catch {
@@ -45,12 +48,12 @@ export function registerDaemon(entry: DaemonIndexEntry): void {
   } else {
     existing.push(entry);
   }
-  writeFileSync(GLOBAL_PATH, JSON.stringify(existing, null, 2));
+  writeIndex(existing);
 }
 
 export function unregisterDaemon(cwd: string): void {
   ensureDir();
   const entries = readDaemons();
   const filtered = entries.filter((e) => e.cwd !== cwd);
-  writeFileSync(GLOBAL_PATH, JSON.stringify(filtered, null, 2));
+  writeIndex(filtered);
 }

@@ -396,9 +396,9 @@ program
   .option("-n, --lines <count>", "number of lines from the end", "50")
   .action(async (opts: any) => {
     try {
-      const { resolve, join } = await import("node:path");
       const { tailTextFile } = await import("./tail.js");
-      const logPath = join(resolve(opts.cwd), ".cco", "daemon-stderr.log");
+      const { stderrLogPath } = await import("./paths.js");
+      const logPath = stderrLogPath(opts.cwd);
       await tailTextFile(logPath, {
         follow: !!opts.follow,
         lines: parseInt(opts.lines, 10),
@@ -551,7 +551,7 @@ async function connectDaemon(cwd?: string): Promise<DaemonClient> {
       `daemon (pid ${info.pid}) is not running. Run ${pc.bold("cco serve")} to restart.`,
     );
   }
-  const client = new DaemonClient(info.socketPath);
+  const client = new DaemonClient(info.port, info.token);
   await client.connect();
   return client;
 }
@@ -600,7 +600,7 @@ function renderWaitResult(r: WaitResult): void {
 async function gatherDaemon(
   d: DaemonIndexEntry,
 ): Promise<{ entry: DaemonIndexEntry; status: StatusResponse; snaps: Map<string, SessionSnapshot> } | null> {
-  const client = new DaemonClient(d.socketPath);
+  const client = new DaemonClient(d.port, d.token);
   try {
     await client.connect();
     const status = await client.call<StatusResponse>("status", {});

@@ -1,9 +1,10 @@
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
 import pc from "picocolors";
 import { connectToOpencodeAgent } from "./connection.js";
 import { BridgeClient } from "./client.js";
 import { JsonlLogger } from "./logger.js";
 import { StreamRenderer } from "./renderer.js";
+import { ensureProjectDir } from "./paths.js";
 
 export type DispatchOptions = {
   task: string;
@@ -39,7 +40,7 @@ export async function dispatch(opts: DispatchOptions): Promise<DispatchResult> {
   const cwd = resolve(opts.cwd ?? process.cwd());
   const logPath =
     opts.logPath ??
-    resolve(cwd, ".cco", `events-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`);
+    join(ensureProjectDir(cwd), `events-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`);
 
   const logger = new JsonlLogger(logPath);
   const renderer = new StreamRenderer({ quiet: opts.quiet, verbose: opts.verbose });

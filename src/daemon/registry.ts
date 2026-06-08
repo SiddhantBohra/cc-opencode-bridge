@@ -1,8 +1,9 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname } from "node:path";
+import { sessionsPath } from "../paths.js";
 
 /**
- * Persistent session registry at `.cco/sessions.json`.
+ * Persistent session registry at ~/.cco/projects/<encoded-cwd>/sessions.json.
  *
  * The daemon holds live SessionState in memory; this registry survives
  * daemon restarts so sessions can be listed and resumed later.
@@ -27,7 +28,7 @@ export class SessionRegistry {
   private entries = new Map<string, RegistryEntry>();
 
   constructor(cwd: string) {
-    this.path = join(resolve(cwd), ".cco", "sessions.json");
+    this.path = sessionsPath(cwd);
   }
 
   async load(): Promise<void> {

@@ -2,15 +2,23 @@
 
 **ACP-native bidirectional bridge from Claude Code to opencode.** One long-lived daemon keeps opencode alive across unlimited turns. Claude Code sends tasks, follow-ups, and answers; opencode streams thoughts, tool calls, file edits, and questions back — all over the Agent Client Protocol, all in real time, with zero MCP.
 
+```mermaid
+flowchart LR
+    CC["Claude Code<br/>(Bash calls)"]
+    BR["cc-opencode-bridge<br/>daemon"]
+    OC["opencode acp<br/>(one long-lived subprocess)"]
+    ST[("~/.cco/projects/&lt;cwd&gt;/<br/>daemon.json · sessions · events<br/>never in your repo")]
+
+    CC -- "cco start / say / answer / cancel" --> BR
+    BR -- "wait · events (NDJSON)" --> CC
+    BR -- "ACP JSON-RPC over stdio" --> OC
+    OC -- "session/update · request_permission" --> BR
+    BR --> ST
+
+    linkStyle 0,1 stroke:#888
 ```
-┌───────────────┐   cco start/say/   ┌──────────────────┐   ACP JSON-RPC    ┌──────────────┐
-│  Claude Code  │──  answer/cancel ─▶│  cc-opencode-    │──  over stdio  ──▶│  opencode    │
-│  (Bash calls) │◀── wait/events ───│  bridge daemon   │◀── (NDJSON)  ────│   acp        │
-└───────────────┘   (Unix socket)    └──────────────────┘                   └──────────────┘
-                                              │
-                                              ├─▶ JSONL event log per session
-                                              └─▶ .cco/daemon.sock (IPC)
-```
+
+> The Claude Code ↔ daemon channel is **loopback TCP** authenticated by a **per-daemon token** — see [Storage & security](#storage--security).
 
 ---
 
@@ -177,18 +185,33 @@ cco stop --cwd /work
 
 ### Daemon mode
 
-```
-cco serve
-  └─ spawns `opencode acp` (one long-lived subprocess)
-  └─ listens on .cco/daemon.sock (Unix domain socket)
-  └─ manages N concurrent sessions with per-session state machines:
-      idle → running → (awaiting_answer ↔ running)* → idle
+`cco serve` spawns one long-lived `opencode acp`, binds a loopback TCP port, and writes `~/.cco/projects/<encoded-cwd>/daemon.json` (`{port, token, …}`, mode `0600`). Every `cco` subcommand is a short-lived client that reads that file and authenticates:
 
-cco start/say/answer/cancel/wait/events/end/stop
-  └─ connects to .cco/daemon.sock
-  └─ sends one JSON-RPC request
-  └─ reads response (or streams events for `events --follow`)
-  └─ disconnects + exits
+```mermaid
+sequenceDiagram
+    participant CLI as cco start / say / wait …
+    participant D as daemon (127.0.0.1:port)
+    participant OC as opencode acp
+
+    CLI->>D: connect + token (from daemon.json)
+    D-->>CLI: reject "unauthorized" if token bad
+    CLI->>D: JSON-RPC request
+    D->>OC: ACP session/prompt
+    OC-->>D: session/update stream (NDJSON)
+    D-->>CLI: result · or events (--follow)
+    CLI->>D: disconnect + exit
+```
+
+Each session runs a per-session state machine:
+
+```mermaid
+stateDiagram-v2
+    [*] --> idle
+    idle --> running: start / say
+    running --> awaiting_answer: request_permission
+    awaiting_answer --> running: cco answer
+    running --> idle: end_turn / cancelled
+    idle --> [*]: end / stop
 ```
 
 ### ACP client implementation
@@ -224,9 +247,26 @@ opencode's `acp` command stays alive until stdin closes (no idle timeout, no max
 
 opencode's `session/prompt` **always resolves with `stopReason: "end_turn"`** — even when the turn is cancelled. On `session/cancel`, opencode 1.16+ aborts the active run but still resolves the pending prompt call cleanly with `end_turn` (older versions rejected it with a JSON-RPC error). So a cancelled turn is **indistinguishable from a completed one by stop reason alone**. The bridge handles both: when `cco cancel` fires, it flags the session `cancelled` before issuing `session/cancel`, then maps the resolved (or rejected) turn to `reason: "cancelled"` — so `cco wait` reports `cancelled` (exit 11) on every opencode version, not a false `end_turn`.
 
+### Storage & security
+
+All cco state lives under a single per-user root — **never in your project directory** — keyed per project by the encoded cwd, the same scheme Claude Code uses:
+
+```
+~/.cco/
+  daemons.json                                 # global fleet index (cco top)
+  projects/
+    -Users-me-my-project/                      # one dir per project (cwd, / → -)
+      daemon.json        # { pid, childPid, port, token, … }   (mode 0600)
+      sessions.json      # session registry
+      events-<sid>.jsonl # per-session event log
+      daemon-stderr.log  # opencode child stderr
+```
+
+Override the root with the `CCO_HOME` env var. The daemon↔CLI channel is **loopback TCP** (`127.0.0.1`, ephemeral port) — no Unix socket, so no path-length limits and nothing in your repo. It's guarded by a **per-daemon token**: a 256-bit secret written to `daemon.json` (mode `0600`) that every CLI request must present (constant-time compared), so other local processes can't drive your daemon. The optional `--http` dashboard binds `127.0.0.1` only.
+
 ### Session persistence
 
-Sessions are recorded in `.cco/sessions.json` (id, first task, turn count, last message, timestamps). The registry survives daemon restarts — `cco sessions` lists past work even with the daemon down. Sending `cco say` to a session the daemon doesn't have in memory triggers an automatic ACP `session/resume`: opencode persists conversations server-side, so the full context (files discussed, decisions made) comes back, even days later in a fresh daemon.
+Sessions are recorded in `~/.cco/projects/<cwd>/sessions.json` (id, first task, turn count, last message, timestamps). The registry survives daemon restarts — `cco sessions` lists past work even with the daemon down. Sending `cco say` to a session the daemon doesn't have in memory triggers an automatic ACP `session/resume`: opencode persists conversations server-side (its own SQLite store), so the full context (files discussed, decisions made) comes back, even days later in a fresh daemon.
 
 ```bash
 cco sessions --cwd /work          # what was I working on?
@@ -235,7 +275,7 @@ cco say ses_abc123 "continue where we left off" --cwd /work   # auto-resumes
 
 ### Event log
 
-Every session produces a JSONL event log at `.cco/events-<sessionId>.jsonl`:
+Every session produces a JSONL event log at `~/.cco/projects/<cwd>/events-<sessionId>.jsonl`:
 
 ```jsonl
 {"ts":"...","kind":"turn_start","data":{"turnCount":1,"prompt":"..."}}

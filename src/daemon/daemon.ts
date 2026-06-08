@@ -1,8 +1,9 @@
-import { createServer, type Server, type Socket } from "node:net";
+import { createServer, type Server, type Socket, type AddressInfo } from "node:net";
 import { createInterface } from "node:readline";
-import { resolve, join } from "node:path";
-import { writeFile, mkdir, unlink, readFile } from "node:fs/promises";
-import { createWriteStream, existsSync, type WriteStream } from "node:fs";
+import { resolve } from "node:path";
+import { writeFile, readFile, chmod, unlink } from "node:fs/promises";
+import { createWriteStream, type WriteStream } from "node:fs";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import {
   ClientSideConnection,
   PROTOCOL_VERSION,
@@ -34,6 +35,12 @@ import { SessionState } from "./session-state.js";
 import { SessionRegistry } from "./registry.js";
 import { registerDaemon, unregisterDaemon } from "./global-registry.js";
 import { HttpServer } from "./http-server.js";
+import {
+  ensureProjectDir,
+  daemonInfoPath as daemonInfoPathFor,
+  stderrLogPath,
+  eventsLogPath,
+} from "../paths.js";
 import type {
   DaemonInfo,
   IpcRequest,
@@ -67,7 +74,8 @@ export class Daemon {
   private sessions = new Map<string, SessionState>();
   private registry!: SessionRegistry;
   private terminalHost = new TerminalHost();
-  private socketPath!: string;
+  private port!: number;
+  private token!: string;
   private daemonInfoPath!: string;
   private shuttingDown = false;
   private stderrLogStream: WriteStream | null = null;
@@ -85,24 +93,21 @@ export class Daemon {
     return [...this.sessions.values()].map((s) => s.toInfo());
   }
 
-  /** Start the daemon: spawn opencode, initialize ACP, listen on socket. */
+  /** Start the daemon: spawn opencode, initialize ACP, listen on loopback TCP. */
   async start(): Promise<void> {
-    const ccoDir = join(this.opts.cwd, ".cco");
-    await mkdir(ccoDir, { recursive: true });
-    this.socketPath = join(ccoDir, "daemon.sock");
-    this.daemonInfoPath = join(ccoDir, "daemon.json");
+    // All state lives under ~/.cco/projects/<encoded-cwd>/ — never in the project.
+    ensureProjectDir(this.opts.cwd);
+    this.daemonInfoPath = daemonInfoPathFor(this.opts.cwd);
+    // Per-daemon secret: clients must present it on every request. The
+    // daemon binds loopback only, so this guards against other local processes.
+    this.token = randomBytes(32).toString("hex");
     this.registry = new SessionRegistry(this.opts.cwd);
     await this.registry.load();
-
-    // Clean up stale socket
-    if (existsSync(this.socketPath)) {
-      await unlink(this.socketPath).catch(() => {});
-    }
 
     // Spawn opencode acp
     await this.spawnAgent();
 
-    // Listen for CLI connections
+    // Listen for CLI connections (binds 127.0.0.1, sets this.port)
     await this.listen();
 
     // Start HTTP dashboard if configured
@@ -115,17 +120,19 @@ export class Daemon {
       await this.httpServer.start();
     }
 
-    // Write daemon info file
+    // Write daemon info file (0600 — contains the auth token)
     const info: DaemonInfo = {
       pid: process.pid,
       childPid: this.child?.pid,
-      socketPath: this.socketPath,
+      port: this.port,
+      token: this.token,
       cwd: this.opts.cwd,
       startedAt: new Date().toISOString(),
       agentName: this.initResult.agentInfo?.name,
       agentVersion: this.initResult.agentInfo?.version,
     };
-    await writeFile(this.daemonInfoPath, JSON.stringify(info, null, 2));
+    await writeFile(this.daemonInfoPath, JSON.stringify(info, null, 2), { mode: 0o600 });
+    await chmod(this.daemonInfoPath, 0o600).catch(() => {});
     registerDaemon(info);
 
     // Graceful shutdown
@@ -134,7 +141,7 @@ export class Daemon {
     process.on("SIGTERM", shutdown);
 
     const agentLabel = `${info.agentName ?? "agent"} v${info.agentVersion ?? "?"}`;
-    process.stderr.write(`daemon: listening on ${this.socketPath} (${agentLabel})\n`);
+    process.stderr.write(`daemon: listening on 127.0.0.1:${this.port} (${agentLabel})\n`);
   }
 
   /** Graceful shutdown. */
@@ -184,8 +191,7 @@ export class Daemon {
     // Remove from global registry
     unregisterDaemon(this.opts.cwd);
 
-    // Clean up files
-    await unlink(this.socketPath).catch(() => {});
+    // Clean up the daemon info file (no socket file to remove — TCP).
     await unlink(this.daemonInfoPath).catch(() => {});
 
     process.exit(0);
@@ -203,7 +209,7 @@ export class Daemon {
     }) as ChildProcessWithoutNullStreams;
 
     if (!this.opts.inheritStderr) {
-      const logPath = join(this.opts.cwd, ".cco", "daemon-stderr.log");
+      const logPath = stderrLogPath(this.opts.cwd);
       this.stderrLogStream = createWriteStream(logPath, { flags: "a" });
       this.child.stderr.pipe(this.stderrLogStream);
     }
@@ -319,7 +325,11 @@ export class Daemon {
         process.stderr.write(`daemon: socket error: ${(err as Error).message}\n`);
         reject(err);
       });
-      this.server.listen(this.socketPath, () => resolve());
+      // Loopback only + ephemeral port — never exposed off-host.
+      this.server.listen(0, "127.0.0.1", () => {
+        this.port = (this.server.address() as AddressInfo).port;
+        resolve();
+      });
     });
   }
 
@@ -327,15 +337,33 @@ export class Daemon {
     const rl = createInterface({ input: socket, crlfDelay: Infinity });
     rl.on("line", async (line) => {
       if (!line.trim()) return;
+      let raw: { token?: unknown; id?: unknown };
       try {
-        const req = JSON.parse(line) as IpcRequest;
-        await this.handleRequest(req, socket);
+        raw = JSON.parse(line);
       } catch (err) {
-        const resp: IpcResponse = {
+        this.sendResponse(socket, {
           id: "unknown",
           error: { code: -1, message: (err as Error).message },
-        };
-        this.sendResponse(socket, resp);
+        });
+        return;
+      }
+      // Reject any request that doesn't present the daemon's token. Loopback
+      // bind keeps us off the network; the token keeps other local processes out.
+      if (typeof raw.token !== "string" || !timingSafeEqualStr(raw.token, this.token)) {
+        this.sendResponse(socket, {
+          id: typeof raw.id === "string" ? raw.id : "unknown",
+          error: { code: -32001, message: "unauthorized" },
+        });
+        socket.destroy();
+        return;
+      }
+      try {
+        await this.handleRequest(raw as unknown as IpcRequest, socket);
+      } catch (err) {
+        this.sendResponse(socket, {
+          id: "unknown",
+          error: { code: -1, message: (err as Error).message },
+        });
       }
     });
   }
@@ -452,7 +480,7 @@ export class Daemon {
 
   /** Create and register an in-memory SessionState. */
   private trackSession(sid: string, cwd: string): SessionState {
-    const logPath = join(cwd, ".cco", `events-${sid}.jsonl`);
+    const logPath = eventsLogPath(cwd, sid);
     const sess = new SessionState(sid, cwd, logPath);
     this.sessions.set(sid, sess);
     return sess;
@@ -562,12 +590,19 @@ export class Daemon {
   }
 }
 
-// ─── Daemon info helpers (used by CLI to find the socket) ───────────────────
+/** Constant-time string compare (avoids leaking the token via timing). */
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+// ─── Daemon info helpers (used by CLI to find the daemon's port/token) ───────
 
 export async function readDaemonInfo(cwd: string): Promise<DaemonInfo | null> {
-  const infoPath = join(resolve(cwd), ".cco", "daemon.json");
   try {
-    const raw = await readFile(infoPath, "utf8");
+    const raw = await readFile(daemonInfoPathFor(cwd), "utf8");
     return JSON.parse(raw) as DaemonInfo;
   } catch {
     return null;

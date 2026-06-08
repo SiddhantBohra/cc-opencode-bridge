@@ -1,23 +1,26 @@
 import { connect, type Socket } from "node:net";
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
-import type { IpcRequest, IpcResponse } from "./ipc.js";
+import type { IpcResponse } from "./ipc.js";
 
 /**
- * CLI-side IPC client. Connects to the daemon's Unix socket,
- * sends one request, reads one or more responses, disconnects.
+ * CLI-side IPC client. Connects to the daemon over loopback TCP and
+ * authenticates every request with the daemon's token (from daemon.json).
  */
 export class DaemonClient {
   private socket!: Socket;
 
-  constructor(private socketPath: string) {}
+  constructor(
+    private port: number,
+    private token: string,
+  ) {}
 
-  /** Connect to the daemon socket. */
+  /** Connect to the daemon's loopback TCP port. */
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.socket = connect(this.socketPath, () => resolve());
+      this.socket = connect(this.port, "127.0.0.1", () => resolve());
       this.socket.on("error", (err) =>
-        reject(new Error(`cannot connect to daemon at ${this.socketPath}: ${err.message}`)),
+        reject(new Error(`cannot connect to daemon on 127.0.0.1:${this.port}: ${err.message}`)),
       );
     });
   }
@@ -28,7 +31,7 @@ export class DaemonClient {
    */
   async call<T = unknown>(method: string, params: Record<string, unknown>): Promise<T> {
     const id = randomUUID();
-    const req = { id, method, params } as IpcRequest;
+    const req = { id, method, params, token: this.token };
     this.socket.write(JSON.stringify(req) + "\n");
 
     return new Promise<T>((resolve, reject) => {
@@ -63,7 +66,7 @@ export class DaemonClient {
     onEvent: (event: unknown) => void,
   ): Promise<unknown> {
     const id = randomUUID();
-    const req = { id, method, params } as IpcRequest;
+    const req = { id, method, params, token: this.token };
     this.socket.write(JSON.stringify(req) + "\n");
 
     return new Promise<unknown>((resolve, reject) => {
