@@ -16,7 +16,9 @@ import type {
   WaitResult,
   EventEntry,
   SessionSnapshot,
+  DaemonIndexEntry,
 } from "./daemon/ipc.js";
+import { readDaemons } from "./daemon/global-registry.js";
 import { StreamRenderer } from "./renderer.js";
 
 const program = new Command();
@@ -241,6 +243,19 @@ program
         renderStatus(result);
       }
       client.close();
+    } catch (err) {
+      die(err);
+    }
+  });
+
+program
+  .command("top")
+  .description("Live fleet dashboard of all daemons and their sessions")
+  .option("--once", "print a single snapshot and exit")
+  .option("-i, --interval <ms>", "refresh interval", "1500")
+  .action(async (opts: any) => {
+    try {
+      await handleTop(!!opts.once, parseInt(opts.interval, 10));
     } catch (err) {
       die(err);
     }
@@ -574,6 +589,155 @@ function renderWaitResult(r: WaitResult): void {
       process.stdout.write(`${pc.yellow("⏱")} timeout — turn still running\n`);
       break;
   }
+}
+
+// ─── cco top — live fleet dashboard ──────────────────────────────────────────
+
+/** Collect one daemon's status + a per-session activity snapshot. */
+async function gatherDaemon(
+  d: DaemonIndexEntry,
+): Promise<{ entry: DaemonIndexEntry; status: StatusResponse; snaps: Map<string, SessionSnapshot> } | null> {
+  const client = new DaemonClient(d.socketPath);
+  try {
+    await client.connect();
+    const status = await client.call<StatusResponse>("status", {});
+    const snaps = new Map<string, SessionSnapshot>();
+    for (const sess of status.sessions) {
+      try {
+        snaps.set(sess.sessionId, await client.call<SessionSnapshot>("snapshot", { sessionId: sess.sessionId }));
+      } catch {
+        /* session may have just ended; skip its snapshot */
+      }
+    }
+    return { entry: d, status, snaps };
+  } catch {
+    return null; // socket gone / daemon dead — pruned on next readDaemons()
+  } finally {
+    client.close();
+  }
+}
+
+function topStatusColor(status: string): (s: string) => string {
+  return status === "idle"
+    ? pc.green
+    : status === "running"
+      ? pc.cyan
+      : status === "awaiting_answer"
+        ? pc.yellow
+        : pc.dim;
+}
+
+/** Render the fleet table as an array of lines (no terminal control codes). */
+async function renderTop(): Promise<string[]> {
+  const daemons = readDaemons();
+  const lines: string[] = [];
+  lines.push(pc.bold(`cco fleet — ${daemons.length} daemon${daemons.length === 1 ? "" : "s"}`));
+  if (daemons.length === 0) {
+    lines.push(pc.dim("  no daemons running — start one with `cco serve --cwd <dir>`"));
+    return lines;
+  }
+
+  const gathered = (await Promise.all(daemons.map(gatherDaemon))).filter(
+    (g): g is NonNullable<typeof g> => g !== null,
+  );
+
+  const header =
+    "  " +
+    pc.dim("CWD".padEnd(22)) +
+    pc.dim("SID".padEnd(12)) +
+    pc.dim("STATE".padEnd(16)) +
+    pc.dim("TOKENS".padEnd(14)) +
+    pc.dim("ACTIVITY");
+  lines.push(header);
+
+  for (const g of gathered) {
+    const cwdLabel = g.entry.cwd.split("/").slice(-1)[0] || g.entry.cwd;
+    const pids = pc.dim(`pid ${g.entry.pid}·acp ${g.entry.childPid ?? "?"}`);
+    lines.push(`  ${pc.bold(truncate(cwdLabel, 20).padEnd(20))}  ${pids}`);
+
+    if (g.status.sessions.length === 0) {
+      lines.push("  " + pc.dim("    (no sessions)"));
+      continue;
+    }
+    for (const sess of g.status.sessions) {
+      const snap = g.snaps.get(sess.sessionId);
+      const used = snap?.tokenUsage?.used;
+      const size = snap?.tokenUsage?.size;
+      const tokens = used !== undefined ? `${formatted(used)}${size ? "/" + formatted(size) : ""}` : "—";
+
+      let activity = "";
+      if (sess.status === "awaiting_answer") {
+        activity = pc.yellow(`? ${sess.pendingQuestion?.title ?? "permission"}`);
+      } else if (snap) {
+        const running = snap.toolCalls.find((t) => t.status === "running" || t.status === "pending");
+        if (running) activity = `${running.title || running.kind}`;
+        else if (snap.lastThought) activity = pc.dim(snap.lastThought.replace(/\s+/g, " "));
+        else if (snap.lastMessage) activity = snap.lastMessage.replace(/\s+/g, " ");
+      }
+
+      const row =
+        "    " +
+        truncate(sess.sessionId, 10).padEnd(10) +
+        "  " +
+        topStatusColor(sess.status)(sess.status.padEnd(14)) +
+        tokens.padEnd(14) +
+        truncate(stripAnsi(activity), 36);
+      lines.push("  " + row);
+    }
+  }
+  return lines;
+}
+
+async function handleTop(once: boolean, intervalMs: number): Promise<void> {
+  // One-shot / non-TTY: print a single snapshot and exit.
+  if (once || !process.stdout.isTTY) {
+    const lines = await renderTop();
+    process.stdout.write(lines.join("\n") + "\n");
+    return;
+  }
+
+  const stdin = process.stdin;
+  const enterAlt = () => process.stdout.write("\x1b[?1049h\x1b[?25l");
+  const leaveAlt = () => process.stdout.write("\x1b[?25h\x1b[?1049l");
+
+  let stopped = false;
+  const cleanup = () => {
+    if (stopped) return;
+    stopped = true;
+    if (stdin.isTTY) stdin.setRawMode(false);
+    stdin.pause();
+    leaveAlt();
+  };
+
+  if (stdin.isTTY) stdin.setRawMode(true);
+  stdin.resume();
+  stdin.on("data", (buf) => {
+    const k = buf.toString();
+    if (k === "q" || k === "\x03") {
+      cleanup();
+      process.exit(0);
+    }
+  });
+  process.on("SIGINT", () => {
+    cleanup();
+    process.exit(0);
+  });
+
+  enterAlt();
+  while (!stopped) {
+    const lines = await renderTop();
+    // home cursor, clear, repaint
+    process.stdout.write("\x1b[H\x1b[2J");
+    process.stdout.write(lines.join("\n"));
+    process.stdout.write(pc.dim(`\n\n  refreshing every ${intervalMs}ms · q to quit`));
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
+/** Strip ANSI escape sequences (for width-accurate truncation). */
+function stripAnsi(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
 function renderStatus(s: StatusResponse): void {

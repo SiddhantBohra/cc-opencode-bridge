@@ -32,6 +32,7 @@ import { Readable, Writable } from "node:stream";
 import { TerminalHost } from "../terminal-host.js";
 import { SessionState } from "./session-state.js";
 import { SessionRegistry } from "./registry.js";
+import { registerDaemon, unregisterDaemon } from "./global-registry.js";
 import type {
   DaemonInfo,
   IpcRequest,
@@ -103,6 +104,7 @@ export class Daemon {
       agentVersion: this.initResult.agentInfo?.version,
     };
     await writeFile(this.daemonInfoPath, JSON.stringify(info, null, 2));
+    registerDaemon(info);
 
     // Graceful shutdown
     const shutdown = () => this.stop();
@@ -153,6 +155,9 @@ export class Daemon {
       });
       this.child?.kill();
     });
+
+    // Remove from global registry
+    unregisterDaemon(this.opts.cwd);
 
     // Clean up files
     await unlink(this.socketPath).catch(() => {});
