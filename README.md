@@ -94,15 +94,97 @@ cco wait $SID --cwd ./my-app
 
 ---
 
+## Watching opencode work
+
+When you dispatch a task, `opencode acp` runs **headless** as a child of the daemon — there's no attached terminal, so by default you don't see it think or act. cco gives you four ways to watch it live, plus a browser dashboard.
+
+### In the terminal
+
+**1. Live progress while you wait — `cco wait --stream`**
+
+The orchestration view: opencode's thoughts, tool calls, and file diffs render in real time as it works, then a machine-readable `---RESULT---` line. This is what makes a dispatch visible inside Claude Code's own output.
+
+```bash
+cco wait $SID --cwd ./my-app --stream      # add -v for raw tool inputs/outputs
+# … live thoughts / tool calls / diffs stream here …
+# done  context 9.6k/200.0k (5%)
+# ---RESULT---
+# {"reason":"end_turn","sessionId":"ses_…","lastMessage":"…"}
+```
+
+**2. Follow a session's event feed — `cco events --follow`**
+
+Replays the session so far, then tails new events as a scrolling, rendered log. `--json` for the raw NDJSON.
+
+```bash
+cco events $SID --cwd ./my-app --follow
+```
+
+**3. Full-screen live view — `cco attach`**
+
+Re-attach to a running session and watch it like the native opencode TUI: a fixed, in-place frame showing the current tool call, the streaming thought, and token usage. Press `q` to detach — the turn keeps running.
+
+```bash
+cco attach $SID --cwd ./my-app
+```
+```
+┌─ ses_abc · turn 3 · running ───────────────────────────┐
+│ 💭 thinking: need to add bcrypt hashing…               │
+│ ▸ edit  src/auth.ts   ✓                                 │
+│ $ bash  npm test      ⠹ running                         │
+│ context: 12.4k / 200.0k tokens (6%)                    │
+└──────────────────────── q to detach ───────────────────┘
+```
+
+**4. The whole fleet — `cco top`**
+
+A live, `htop`-style table of **every** daemon and session across all your projects (state, token usage, current activity). `--once` prints a single snapshot (non-TTY safe).
+
+```bash
+cco top                # live, refreshing
+cco top --once         # one snapshot, good for scripts
+```
+```
+cco fleet — 2 daemons
+  CWD                   SID         STATE      TOKENS         ACTIVITY
+  my-app                pid 8092·acp 8094
+      ses_15828…  running    —              edit src/auth.ts
+  api-gateway           pid 8120·acp 8123
+      ses_1582c…  awaiting   8.1k/200.0k    ? Run npm install?
+```
+
+> Want opencode's own stderr (startup errors, crashes)? `cco logs -f --cwd ./my-app`.
+
+### In the browser — `cco serve --http`
+
+Start the daemon with a web dashboard (bound to `127.0.0.1` only):
+
+```bash
+cco serve --cwd ./my-app --http 7777
+# daemon: http dashboard on http://localhost:7777
+```
+
+Open <http://localhost:7777>: a session sidebar (state badges, polled live), a main pane that opens a **Server-Sent Events** stream for the selected session and renders the event feed as it arrives, and a header showing token usage. The same data is available as plain HTTP for your own tooling:
+
+```bash
+curl localhost:7777/api/sessions          # [{sessionId,status,turnCount}, …]
+curl localhost:7777/api/snapshot/$SID     # current state + tool calls + tokens
+curl -N localhost:7777/api/events/$SID    # SSE: history replay, then live
+```
+
+---
+
 ## CLI reference
 
 ### Daemon lifecycle
 
 | Command | Purpose |
 | --- | --- |
-| `cco serve [--cwd] [--agent] [--stderr]` | Start the daemon (keeps opencode alive) |
+| `cco serve [--cwd] [--agent] [--stderr] [--http [port]]` | Start the daemon (keeps opencode alive); `--http` adds a web dashboard |
 | `cco stop [--cwd]` | Shut down the daemon |
-| `cco status [--cwd] [--json]` | Show daemon info + active sessions |
+| `cco status [--cwd] [--json]` | Show daemon info (incl. opencode child PID) + active sessions |
+| `cco logs [--cwd] [-f] [-n lines]` | Tail the opencode child's stderr |
+| `cco top [--once] [-i ms]` | Live dashboard of **all** daemons + their sessions |
 
 ### Session control
 
@@ -110,7 +192,8 @@ cco wait $SID --cwd ./my-app
 | --- | --- |
 | `cco start <task> [--cwd]` | Create session, send first task, return `{sessionId}` |
 | `cco say <sid> <text> [--cwd]` | Send follow-up to an idle session |
-| `cco wait <sid> [--cwd] [-t ms] [-q]` | Block until turn ends, question, cancel, or timeout |
+| `cco wait <sid> [--cwd] [-t ms] [-q] [-s] [-v]` | Block until turn ends/question/cancel/timeout; `-s` renders live progress |
+| `cco attach <sid> [--cwd]` | Full-screen **live view** of a running session (`q` to detach) |
 | `cco answer <reqid> <optionId> [--cwd]` | Answer a pending question |
 | `cco cancel <sid> [--cwd]` | Cancel an in-progress turn |
 | `cco end <sid> [--cwd]` | Close session, free resources |
@@ -294,11 +377,20 @@ Every session produces a JSONL event log at `~/.cco/projects/<cwd>/events-<sessi
 
 ## Roadmap
 
+Shipped:
+
+- [x] **Watch opencode work** — `cco wait --stream`, `cco events --follow`, `cco attach` (full-screen live view), `cco top` (fleet dashboard), `cco logs`
+- [x] **Web dashboard** via `cco serve --http` — SSE event stream + browser UI
+- [x] **Token usage** surfaced live (context used / window · cost)
+- [x] **Secure per-user state** — everything under `~/.cco`, loopback TCP + per-daemon token, nothing in your repo
+
+Planned:
+
 - [ ] `cco serve --detach` — daemonize without holding the terminal
 - [ ] Auto-start daemon on first `cco start` if not running
 - [ ] Council mode — parallel dispatches in isolated git worktrees with vote-based merge
 - [ ] `session/set_mode` support — switch opencode between architect/code/ask modes
-- [ ] Web dashboard via `cco serve --http` — SSE event stream + browser UI
+- [ ] Slash-command passthrough — `cco say $SID "/compact"` etc. over ACP `available_commands`
 - [ ] Multi-agent — wrap Gemini CLI, Codex, and other ACP-compatible agents behind the same `cco` UX
 - [ ] `_cco/*` extension methods — Claude Code→opencode sidechannel for mid-turn context injection
 
