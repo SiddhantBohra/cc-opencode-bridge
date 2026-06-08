@@ -132,3 +132,6 @@ export type DaemonInfo = {
   agentName?: string;
   agentVersion?: string;
 };
+
+/** Entry in the global daemon index (~/.cco/daemons.json). Same shape as DaemonInfo. */
+export type DaemonIndexEntry = DaemonInfo;
