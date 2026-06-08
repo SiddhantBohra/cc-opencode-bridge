@@ -53,3 +53,57 @@ function summarize(d: unknown): string {
     return String(d);
   }
 }
+
+/**
+ * Tail a raw text file (not JSONL). Reads last N lines, optionally follow.
+ */
+export async function tailTextFile(
+  path: string,
+  opts: { follow?: boolean; lines?: number },
+): Promise<void> {
+  const { stat } = await import("node:fs/promises");
+  const { createReadStream, watch } = await import("node:fs");
+  const { createInterface } = await import("node:readline");
+
+  const n = opts.lines ?? 50;
+
+  let st = await stat(path).catch(() => null);
+  if (!st) {
+    process.stderr.write(pc.red(`error: log file not found at ${path}\n`));
+    process.exit(1);
+  }
+
+  // Print last N lines
+  const readSize = Math.min(st.size, 65536);
+  const start = Math.max(0, st.size - readSize);
+  const stream = createReadStream(path, { start, encoding: "utf8" });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+  const allLines: string[] = [];
+  for await (const line of rl) {
+    allLines.push(line);
+  }
+  for (const line of allLines.slice(-n)) {
+    process.stdout.write(line + "\n");
+  }
+
+  if (!opts.follow) return;
+
+  let offset = st.size;
+  const watcher = watch(path, async () => {
+    st = await stat(path).catch(() => null);
+    if (!st || st.size <= offset) return;
+    const s = createReadStream(path, { start: offset, encoding: "utf8" });
+    const rl2 = createInterface({ input: s, crlfDelay: Infinity });
+    for await (const line of rl2) {
+      offset += Buffer.byteLength(line + "\n", "utf8");
+      process.stdout.write(line + "\n");
+    }
+  });
+
+  process.on("SIGINT", () => {
+    watcher.close();
+    process.exit(0);
+  });
+
+  await new Promise(() => {});
+}

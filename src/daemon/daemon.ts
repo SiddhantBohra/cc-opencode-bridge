@@ -2,7 +2,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { createInterface } from "node:readline";
 import { resolve, join } from "node:path";
 import { writeFile, mkdir, unlink, readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { createWriteStream, existsSync, type WriteStream } from "node:fs";
 import {
   ClientSideConnection,
   PROTOCOL_VERSION,
@@ -66,6 +66,7 @@ export class Daemon {
   private socketPath!: string;
   private daemonInfoPath!: string;
   private shuttingDown = false;
+  private stderrLogStream: WriteStream | null = null;
 
   constructor(opts: DaemonOptions) {
     this.opts = { ...opts, cwd: resolve(opts.cwd) };
@@ -94,6 +95,7 @@ export class Daemon {
     // Write daemon info file
     const info: DaemonInfo = {
       pid: process.pid,
+      childPid: this.child?.pid,
       socketPath: this.socketPath,
       cwd: this.opts.cwd,
       startedAt: new Date().toISOString(),
@@ -130,6 +132,12 @@ export class Daemon {
     // Close socket server
     this.server?.close();
 
+    // Close stderr log stream
+    if (this.stderrLogStream) {
+      this.stderrLogStream.end();
+      this.stderrLogStream = null;
+    }
+
     // Kill opencode
     try {
       this.child?.stdin?.end();
@@ -163,6 +171,12 @@ export class Daemon {
       cwd: this.opts.cwd,
       stdio: ["pipe", "pipe", this.opts.inheritStderr ? "inherit" : "pipe"],
     }) as ChildProcessWithoutNullStreams;
+
+    if (!this.opts.inheritStderr) {
+      const logPath = join(this.opts.cwd, ".cco", "daemon-stderr.log");
+      this.stderrLogStream = createWriteStream(logPath, { flags: "a" });
+      this.child.stderr.pipe(this.stderrLogStream);
+    }
 
     this.child.on("error", (err) => {
       process.stderr.write(`daemon: agent error: ${err.message}\n`);
@@ -325,6 +339,9 @@ export class Daemon {
         case "events":
           this.handleEvents(req.id, req.params, socket);
           break;
+        case "snapshot":
+          this.handleSnapshot(req.id, req.params, socket);
+          break;
         case "end":
           await this.handleEnd(req.id, req.params, socket);
           break;
@@ -456,6 +473,7 @@ export class Daemon {
       id,
       result: {
         pid: process.pid,
+        childPid: this.child?.pid,
         agentName: this.initResult.agentInfo?.name,
         agentVersion: this.initResult.agentInfo?.version,
         sessions,
@@ -486,6 +504,14 @@ export class Daemon {
     });
     socket.on("close", unsub);
     socket.on("error", unsub);
+  }
+
+  private handleSnapshot(id: string, params: { sessionId: string }, socket: Socket): void {
+    const sess = this.requireSession(params.sessionId);
+    this.sendResponse(socket, {
+      id,
+      result: sess.snapshot(),
+    });
   }
 
   private async handleEnd(id: string, params: { sessionId: string }, socket: Socket): Promise<void> {
