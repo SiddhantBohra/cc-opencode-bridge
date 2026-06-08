@@ -6,8 +6,6 @@ import { dispatch } from "./dispatch.js";
 import {
   Daemon,
   DaemonClient,
-  readDaemonInfo,
-  isDaemonAlive,
   WAIT_EXIT_CODES,
 } from "./daemon/index.js";
 import type {
@@ -18,8 +16,11 @@ import type {
   SessionSnapshot,
   DaemonIndexEntry,
 } from "./daemon/ipc.js";
-import { readDaemons } from "./daemon/global-registry.js";
-import { StreamRenderer } from "./renderer.js";
+  import { readDaemons } from "./daemon/global-registry.js";
+  import { connectDaemon } from "./daemon/connect.js";
+  import { StreamRenderer } from "./renderer.js";
+  import { loadGraph, runGraph } from "./graph.js";
+  import { runDoctor, renderDoctor } from "./doctor.js";
 
 const program = new Command();
 
@@ -537,24 +538,63 @@ program
     }
   });
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Batch orchestration ─────────────────────────────────────────────────────
 
-async function connectDaemon(cwd?: string): Promise<DaemonClient> {
-  const info = await readDaemonInfo(cwd ?? process.cwd());
-  if (!info) {
-    throw new Error(
-      `no daemon found. Run ${pc.bold("cco serve")} first, or use ${pc.bold("cco dispatch")} for one-shot mode.`,
-    );
-  }
-  if (!isDaemonAlive(info)) {
-    throw new Error(
-      `daemon (pid ${info.pid}) is not running. Run ${pc.bold("cco serve")} to restart.`,
-    );
-  }
-  const client = new DaemonClient(info.port, info.token);
-  await client.connect();
-  return client;
-}
+program
+  .command("graph")
+  .description(
+    "Run a task dependency DAG from a JSONC file (parallel across cwds, serial per cwd)",
+  )
+  .argument("<file>", "path to the graph JSONC file")
+  .option("-d, --cwd <dir>", "default working directory for tasks", process.cwd())
+  .option("--json", "emit only the final JSON summary")
+  .option("-q, --quiet", "suppress live progress")
+  .option("--auto-approve <mode>", "override task policy: allow | deny | fail")
+  .option("--no-auto-spawn", "require pre-started daemons (don't spawn cco serve)")
+  .option("--stop-spawned", "stop daemons this run started, on completion")
+  .option("-t, --timeout <ms>", "default per-task wait timeout", "300000")
+  .action(async (file: string, opts: any) => {
+    try {
+      const graph = loadGraph(file);
+      const result = await runGraph(graph, {
+        defaultCwd: resolve(opts.cwd),
+        json: !!opts.json,
+        quiet: !!opts.quiet,
+        autoApprove: opts.autoApprove,
+        noAutoSpawn: !opts.autoSpawn,
+        stopSpawned: !!opts.stopSpawned,
+        timeout: parseInt(opts.timeout, 10),
+      });
+      if (opts.json) process.stdout.write(JSON.stringify(result) + "\n");
+      process.exit(result.ok ? 0 : 2);
+    } catch (err) {
+      die(err);
+    }
+  });
+
+// ─── Diagnostics ─────────────────────────────────────────────────────────────
+
+program
+  .command("doctor")
+  .description("Check the cco/opencode environment and the daemon fleet")
+  .option("-d, --cwd <dir>", "also check this project's daemon")
+  .option("-a, --agent <cmd>", "agent binary to check", "opencode")
+  .option("--json", "machine-readable report")
+  .action(async (opts: any) => {
+    try {
+      const result = await runDoctor({
+        cwd: opts.cwd,
+        agent: opts.agent,
+        json: !!opts.json,
+      });
+      renderDoctor(result, !!opts.json);
+      process.exit(result.ok ? 0 : 1);
+    } catch (err) {
+      die(err);
+    }
+  });
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
 
 function renderWaitResult(r: WaitResult): void {
   switch (r.reason) {

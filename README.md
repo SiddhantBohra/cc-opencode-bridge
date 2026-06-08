@@ -174,6 +174,39 @@ curl -N localhost:7777/api/events/$SID    # SSE: history replay, then live
 
 ---
 
+## Diagnostics
+
+`cco doctor` is a one-shot environment health check — run it first when a dispatch won't start. It verifies the host (Node ≥ 20, the `opencode` binary — or `--agent <cmd>` — on `PATH` plus its version, and that `~/.cco` is writable) and then probes the whole fleet: for every daemon it checks the PID is alive and the port is reachable. It prints a `✓`/`⚠`/`✗` checklist and exits `0` when nothing failed, `1` otherwise.
+
+```bash
+cco doctor                       # check this host + the whole fleet
+cco doctor --agent gemini        # check a different agent binary
+cco doctor --json                # machine-readable report
+```
+```
+cco doctor
+  ✓ node            v22.19.0  (>= 20)
+  ✓ opencode        on PATH · v1.16.2
+  ✓ storage         ~/.cco writable
+  ✓ daemon my-app       pid 8092 alive · port 51847 reachable
+  ✗ daemon api-gateway  pid 8120 alive · port 51902 unreachable   [PORT_UNREACHABLE]
+  ⚠ daemon legacy       pid 7740 not running (stale daemon.json)   [DAEMON_STALE]
+```
+
+Each failure carries a stable code from the error taxonomy:
+
+| Code | Meaning |
+| --- | --- |
+| `NODE_TOO_OLD` | Node runtime is older than 20 |
+| `BINARY_NOT_FOUND` | The opencode (or `--agent`) binary isn't on `PATH` |
+| `VERSION_TOO_OLD` | The agent binary is present but below the required version |
+| `STORAGE_UNWRITABLE` | `~/.cco` (or `CCO_HOME`) can't be written |
+| `DAEMON_STALE` | `daemon.json` exists but its PID is dead |
+| `PORT_UNREACHABLE` | Daemon PID is alive but its loopback port doesn't answer |
+| `NO_DAEMON` | No daemon registered for this cwd |
+
+---
+
 ## CLI reference
 
 ### Daemon lifecycle
@@ -185,6 +218,7 @@ curl -N localhost:7777/api/events/$SID    # SSE: history replay, then live
 | `cco status [--cwd] [--json]` | Show daemon info (incl. opencode child PID) + active sessions |
 | `cco logs [--cwd] [-f] [-n lines]` | Tail the opencode child's stderr |
 | `cco top [--once] [-i ms]` | Live dashboard of **all** daemons + their sessions |
+| `cco doctor [--cwd] [--agent] [--json]` | Environment health check (Node, agent binary, `~/.cco`, fleet) |
 
 ### Session control
 
@@ -199,6 +233,12 @@ curl -N localhost:7777/api/events/$SID    # SSE: history replay, then live
 | `cco end <sid> [--cwd]` | Close session, free resources |
 | `cco events <sid> [--cwd] [-f] [-s seq] [--json]` | Stream/replay events |
 | `cco sessions [--cwd] [--json]` | List all known sessions — works even when the daemon is down |
+
+### Batch orchestration
+
+| Command | Purpose |
+| --- | --- |
+| `cco graph <file> [-d cwd] [--auto-approve allow\|deny\|fail] [--no-auto-spawn] [--stop-spawned] [-t ms] [--json] [-q]` | Run a task dependency DAG: same cwd sequential, different cwds parallel |
 
 ### Legacy (one-shot, no daemon)
 
@@ -324,6 +364,72 @@ git worktree add .wt-taskB -b taskB && cco serve --cwd .wt-taskB &
 
 Don't ask one opencode session to multiplex parallel work: concurrent prompts on a single ACP connection are undefined behavior (opencode serializes turns through one global event stream per connection). One daemon = one turn at a time, by design. Sessions on a shared daemon isolate *context* (conversations never leak between sessionIds) but not *execution*. Separate processes buy true parallelism, crash isolation, and — with worktrees — file isolation.
 
+### Batch graph mode
+
+`cco graph <file>` turns the fan-out pattern above into a declarative file. A JSONC graph defines tasks with `dependsOn` chains; a task's prompt can interpolate an upstream task's final message via `{{taskId.result}}` (or `{{taskId.result:N}}` for the first *N* chars). It's a **client-side batch-runner** built on the same `start`/`wait`/`answer` primitives — Claude Code (or a human) authors the graph and reads the summary, so the orchestrator stays in charge; opencode never spawns sub-agents.
+
+```jsonc
+{
+  "version": 1,
+  "defaults": { "timeout": 300000, "autoApprove": "fail" },
+  "tasks": [
+    {
+      "id": "analyze",
+      "prompt": "Read src/cli.ts and list the 3 largest functions with line counts.",
+      "cwd": "."
+    },
+    {
+      "id": "plan",
+      // {{analyze.result}} is replaced with analyze's final message before this prompt is sent.
+      "prompt": "Given:\n{{analyze.result}}\nPropose a refactor for the largest one. <150 words.",
+      "dependsOn": ["analyze"],
+      "cwd": "."
+    },
+    {
+      // Different cwd => its own daemon => runs in PARALLEL with the analyze→plan chain.
+      "id": "docs",
+      "prompt": "Summarize README.md in 5 bullet points.",
+      "cwd": "../cc-ob-wt-docs",
+      "autoApprove": ["Read", "Grep"]   // allowlist: only these prompts auto-approve
+    },
+    {
+      "id": "report",
+      // Fan-in: {{plan.result}} inlined whole, {{docs.result:500}} truncated to 500 chars.
+      "prompt": "Combine into one markdown report.\n\n## Plan\n{{plan.result}}\n\n## Docs\n{{docs.result:500}}",
+      "dependsOn": ["plan", "docs"]
+    }
+  ]
+}
+```
+
+```bash
+cco graph examples/graphs/analyze-refactor.jsonc --cwd /work
+#   -d/--cwd <dir>            default cwd for tasks that omit one
+#   --auto-approve <policy>   global allow|deny|fail (per-task autoApprove wins)
+#   --no-auto-spawn           require pre-started daemons (don't `cco serve` per cwd)
+#   --stop-spawned            stop only the daemons this run started
+#   -t/--timeout <ms>   --json   -q/--quiet
+```
+
+**The parallelism rule is the cwd:** tasks sharing a cwd run **sequentially** (one daemon = one turn at a time); tasks on **different** cwds run in **parallel**, each on its own auto-spawned daemon — the documented worktree fan-out, now declarative. The runner walks the DAG in topological order, dispatching a task as soon as its dependencies finish.
+
+Permission prompts during a task follow a per-task `autoApprove` policy that **defaults to `"fail"`**: an unattended batch never silently approves shell or file ops — the task fails and its dependents skip. Opt in per task (or globally via `--auto-approve`) with `"allow"`, `"deny"`, or a title-allowlist (`["Read", "Grep"]`) that auto-approves only matching prompts.
+
+Progress streams as compact, per-lane lines (`✓` done · `▸` running · `⊘` skipped), with a `[lane]` tag grouping tasks by cwd:
+
+```
+[.]              ▸ analyze    running…
+[../cc-ob-wt-docs] ▸ docs     running…       (parallel — different cwd)
+[.]              ✓ analyze    done   12.4s
+[.]              ▸ plan       running…
+[../cc-ob-wt-docs] ✓ docs     done   9.1s
+[.]              ✓ plan       done   15.0s
+[.]              ✓ report     done   8.2s
+graph: 4 done · 0 failed · 0 skipped
+```
+
+Exit codes: **1** = invalid graph (a `dependsOn` cycle or a `{{…}}` reference to an unknown task — caught before anything runs), **0** = every task done, **2** = at least one task failed or was skipped. Add `--json` for a machine-readable summary (per-task status, timing, and result text) that Claude Code can parse to decide what to do next.
+
 ### Key insight from opencode source
 
 opencode's `acp` command stays alive until stdin closes (no idle timeout, no max-turn limit). One subprocess hosts unlimited sessions and turns indefinitely. The daemon keeps stdin open for the life of the process.
@@ -383,6 +489,8 @@ Shipped:
 - [x] **Web dashboard** via `cco serve --http` — SSE event stream + browser UI
 - [x] **Token usage** surfaced live (context used / window · cost)
 - [x] **Secure per-user state** — everything under `~/.cco`, loopback TCP + per-daemon token, nothing in your repo
+- [x] **Task dependency graphs** — `cco graph` runs a declarative DAG (`{{taskId.result}}` interpolation, same-cwd sequential / cross-cwd parallel, `fail`-by-default approval policy)
+- [x] **Diagnostics** — `cco doctor` health-checks Node, the agent binary, `~/.cco`, and the whole daemon fleet with a coded error taxonomy
 
 Planned:
 

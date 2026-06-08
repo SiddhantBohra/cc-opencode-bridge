@@ -1,0 +1,52 @@
+{
+  // Task dependency graph for `cco graph`.
+  // Tasks on the same cwd run sequentially (one daemon = one turn at a time);
+  // tasks on different cwds run in parallel.
+  "version": 1,
+
+  // Defaults applied to every task unless the task overrides them.
+  //   timeout     — per-task wait budget in ms.
+  //   autoApprove — "fail" means: do NOT auto-answer permission prompts;
+  //                 treat any prompt as a failure (safest for unattended runs).
+  //                 A task can override this with an allowlist (see "docs").
+  "defaults": { "timeout": 300000, "autoApprove": "fail" },
+
+  "tasks": [
+    {
+      "id": "analyze",
+      "prompt": "Read src/cli.ts and list the 3 largest functions with their line counts. Reply with just the list, nothing else.",
+      "cwd": "."
+    },
+    {
+      "id": "plan",
+      // {{analyze.result}} is substituted with the full text of the "analyze"
+      // task's final message before this prompt is sent. This is how results
+      // flow down the dependency edge declared in dependsOn.
+      "prompt": "Given this analysis:\n{{analyze.result}}\nPropose a concise refactor for the single largest function. Keep it under 150 words.",
+      "dependsOn": ["analyze"],
+      "cwd": "."
+    },
+    {
+      // Runs in PARALLEL with the analyze->plan chain because it lives on a
+      // different cwd: each cwd gets its own daemon (one opencode process),
+      // and one daemon runs exactly one turn at a time. Different cwd =>
+      // different daemon => concurrent execution. Same cwd would serialize.
+      "id": "docs",
+      "prompt": "Summarize README.md in 5 bullet points.",
+      "cwd": "../cc-ob-wt-docs",
+      // autoApprove allowlist: permission prompts for these tools are auto-
+      // approved for this task only; anything outside the list still fails.
+      // Read/Grep are safe read-only ops, so this task can run unattended.
+      "autoApprove": ["Read", "Grep"]
+    },
+    {
+      "id": "report",
+      // Fan-in: depends on both branches. {{plan.result}} is inlined whole;
+      // {{docs.result:500}} is TRUNCATED to the first 500 characters via the
+      // :N suffix — handy for keeping a large upstream result from blowing up
+      // this prompt. Omitting :N (as with plan) inlines the full text.
+      "prompt": "Combine the refactor plan and the docs summary into one short markdown report.\n\n## Refactor plan\n{{plan.result}}\n\n## Docs summary\n{{docs.result:500}}",
+      "dependsOn": ["plan", "docs"]
+    }
+  ]
+}

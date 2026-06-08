@@ -1,0 +1,13 @@
+{
+  // Intentionally invalid: `cco graph cycle.jsonc` must reject this with a
+  // "cycle detected" error (exit 1) and spawn zero daemons.
+  //
+  // Intentionally invalid — demonstrates cycle detection.
+  // a depends on b, and b depends on a: there is no valid topological order,
+  // so the graph can never start. Each prompt also references the other's
+  // {{id.result}}, which could never be produced.
+  "tasks": [
+    { "id": "a", "prompt": "do a using {{b.result}}", "dependsOn": ["b"] },
+    { "id": "b", "prompt": "do b using {{a.result}}", "dependsOn": ["a"] }
+  ]
+}
