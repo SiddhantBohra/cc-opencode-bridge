@@ -19,6 +19,7 @@ export type IpcRequest =
   | { id: string; method: "wait"; params: WaitParams }
   | { id: string; method: "status"; params: StatusParams }
   | { id: string; method: "events"; params: EventsParams }
+  | { id: string; method: "snapshot"; params: SnapshotParams }
   | { id: string; method: "end"; params: EndParams }
   | { id: string; method: "stop"; params: StopParams };
 
@@ -29,8 +30,38 @@ export type CancelParams = { sessionId: string };
 export type WaitParams = { sessionId: string; timeout?: number };
 export type StatusParams = Record<string, never>;
 export type EventsParams = { sessionId: string; since?: number; follow?: boolean };
+export type SnapshotParams = { sessionId: string };
 export type EndParams = { sessionId: string };
 export type StopParams = Record<string, never>;
+
+export type ToolCallSnapshot = {
+  toolCallId: string;
+  kind?: string;
+  title?: string;
+  status: string;
+  content?: unknown[];
+};
+export type SessionSnapshot = {
+  sessionId: string;
+  status: SessionStatus;
+  turnCount: number;
+  lastThought?: string;
+  lastMessage?: string;
+  toolCalls: ToolCallSnapshot[];
+  // opencode's usage_update reports a single `used` token count against the
+  // context window `size`, plus session `cost` — not an input/output split.
+  tokenUsage: { used?: number; size?: number; cost?: number };
+  pendingQuestion?: PendingQuestion;
+  latestSeq: number;
+};
+
+export type StatusResponse = {
+  pid: number;
+  childPid?: number;
+  agentName?: string;
+  agentVersion?: string;
+  sessions: SessionInfo[];
+};
 
 // ─── Responses (daemon → CLI) ───────────────────────────────────────────────
 
@@ -94,6 +125,7 @@ export const WAIT_EXIT_CODES: Record<WaitReason, number> = {
 
 export type DaemonInfo = {
   pid: number;
+  childPid?: number;
   socketPath: string;
   cwd: string;
   startedAt: string;

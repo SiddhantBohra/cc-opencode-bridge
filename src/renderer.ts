@@ -20,7 +20,7 @@ export class StreamRenderer {
   private inMessage = false;
   private inThought = false;
   private lastToolStatus = new Map<string, string>();
-  private tokenUsage: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } = {};
+  private tokenUsage: { used?: number; size?: number; cost?: number } = {};
 
   constructor(opts: RendererOptions = {}) {
     this.opts = opts;
@@ -88,22 +88,26 @@ export class StreamRenderer {
   }
 
   private trackUsage(u: any): void {
-    // ACP shape varies by agent; accept a few common ones.
-    const t = u.tokens ?? u.usage ?? u;
-    if (typeof t.inputTokens === "number") this.tokenUsage.input = t.inputTokens;
-    if (typeof t.outputTokens === "number") this.tokenUsage.output = t.outputTokens;
-    if (typeof t.cacheReadInputTokens === "number") this.tokenUsage.cacheRead = t.cacheReadInputTokens;
-    if (typeof t.cacheWriteInputTokens === "number") this.tokenUsage.cacheWrite = t.cacheWriteInputTokens;
+    // opencode's usage_update reports { used, size, cost:{amount} }:
+    // `used` tokens against the context window `size`, plus session cost.
+    if (typeof u.used === "number") this.tokenUsage.used = u.used;
+    if (typeof u.size === "number") this.tokenUsage.size = u.size;
+    if (typeof u.cost?.amount === "number") this.tokenUsage.cost = u.cost.amount;
   }
 
   private formatUsage(): string {
     const u = this.tokenUsage;
+    if (u.used === undefined) return "";
+    const fmt = (n: number) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n));
     const parts: string[] = [];
-    if (u.input !== undefined) parts.push(`in:${u.input}`);
-    if (u.output !== undefined) parts.push(`out:${u.output}`);
-    if (u.cacheRead !== undefined) parts.push(`cache_r:${u.cacheRead}`);
-    if (u.cacheWrite !== undefined) parts.push(`cache_w:${u.cacheWrite}`);
-    return parts.length ? `tokens — ${parts.join(" · ")}` : "";
+    if (u.size) {
+      const pct = Math.round((u.used / u.size) * 100);
+      parts.push(`context ${fmt(u.used)}/${fmt(u.size)} (${pct}%)`);
+    } else {
+      parts.push(`${fmt(u.used)} tokens`);
+    }
+    if (u.cost) parts.push(`$${u.cost.toFixed(4)}`);
+    return parts.join(" · ");
   }
 
   private streamChunk(content: any, kind: "message" | "thought"): void {

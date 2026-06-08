@@ -1,5 +1,5 @@
 import type { ClientSideConnection, SessionNotification, RequestPermissionRequest, RequestPermissionResponse } from "@agentclientprotocol/sdk";
-import type { EventEntry, PendingQuestion, SessionInfo, SessionStatus, WaitResult } from "./ipc.js";
+import type { EventEntry, PendingQuestion, SessionInfo, SessionSnapshot, SessionStatus, ToolCallSnapshot, WaitResult } from "./ipc.js";
 import { JsonlLogger } from "../logger.js";
 
 type Waiter = { resolve: (r: WaitResult) => void; timer?: ReturnType<typeof setTimeout> };
@@ -26,6 +26,9 @@ export class SessionState {
   lastActivityAt: string;
   /** Accumulated agent message text for the current/most recent turn. */
   private turnMessage = "";
+  private turnThought = "";
+  private toolCalls = new Map<string, ToolCallSnapshot>();
+  private tokenUsage: { used?: number; size?: number; cost?: number } = {};
 
   private events: EventEntry[] = [];
   private seq = 0;
@@ -67,11 +70,44 @@ export class SessionState {
 
   /** Called by the ACP client's sessionUpdate handler. */
   onSessionUpdate(n: SessionNotification): void {
-    // Accumulate the agent's message text so wait results can carry
-    // opencode's final answer/question without replaying events.
-    const u = n.update as { sessionUpdate?: string; content?: { type?: string; text?: string } };
+    const u = n.update as {
+      sessionUpdate?: string;
+      content?: { type?: string; text?: string };
+      toolCallId?: string;
+      kind?: string;
+      title?: string;
+      status?: string;
+      used?: number;
+      size?: number;
+      cost?: { amount?: number };
+    };
     if (u.sessionUpdate === "agent_message_chunk" && u.content?.type === "text" && u.content.text) {
       this.turnMessage += u.content.text;
+    } else if (u.sessionUpdate === "agent_thought_chunk" && u.content?.type === "text" && u.content.text) {
+      this.turnThought += u.content.text;
+    } else if (u.sessionUpdate === "tool_call" && u.toolCallId) {
+      this.toolCalls.set(u.toolCallId, {
+        toolCallId: u.toolCallId,
+        kind: u.kind,
+        title: u.title,
+        status: u.status ?? "pending",
+      });
+    } else if (u.sessionUpdate === "tool_call_update" && u.toolCallId) {
+      const existing = this.toolCalls.get(u.toolCallId);
+      if (existing) {
+        existing.status = u.status ?? existing.status;
+      } else {
+        this.toolCalls.set(u.toolCallId, {
+          toolCallId: u.toolCallId,
+          kind: u.kind,
+          title: u.title,
+          status: u.status ?? "running",
+        });
+      }
+    } else if (u.sessionUpdate === "usage_update") {
+      if (typeof u.used === "number") this.tokenUsage.used = u.used;
+      if (typeof u.size === "number") this.tokenUsage.size = u.size;
+      if (typeof u.cost?.amount === "number") this.tokenUsage.cost = u.cost.amount;
     }
     this.emit("session_update", n);
   }
@@ -148,6 +184,9 @@ export class SessionState {
     this.status = "running";
     this.turnCount++;
     this.turnMessage = "";
+    this.turnThought = "";
+    this.toolCalls.clear();
+    this.tokenUsage = {};
     this.emit("turn_start", { turnCount: this.turnCount, prompt: text });
 
     try {
@@ -290,6 +329,30 @@ export class SessionState {
         : undefined,
       createdAt: this.createdAt,
       lastActivityAt: this.lastActivityAt,
+    };
+  }
+
+  snapshot(): SessionSnapshot {
+    return {
+      sessionId: this.id,
+      status: this.status,
+      turnCount: this.turnCount,
+      lastThought: this.turnThought || undefined,
+      lastMessage: this.turnMessage || undefined,
+      toolCalls: [...this.toolCalls.values()],
+      tokenUsage: { ...this.tokenUsage },
+      latestSeq: this.seq,
+      pendingQuestion: this.pendingQ
+        ? {
+            requestId: this.pendingQ.requestId,
+            title: this.pendingQ.params.toolCall.title ?? "permission",
+            options: this.pendingQ.params.options.map((o) => ({
+              optionId: o.optionId,
+              name: o.name,
+              kind: o.kind,
+            })),
+          }
+        : undefined,
     };
   }
 
